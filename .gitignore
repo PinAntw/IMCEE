@@ -1,0 +1,22 @@
+# --- 模板 ---
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+
+checkpoints/
+experiment_scripts/
+modules/CFIB/
+modules/dual/
+modules/e2e_gnn/
+modules/emotion/
+modules/node_explain/
+modules/tag/
+outputs/
