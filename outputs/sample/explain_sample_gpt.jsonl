@@ -1,0 +1,16 @@
+{"id": "te_546__u1__u2", "score": 0.4, "label": "cause", "reason": "Asking about the bride-to-be may prompt feelings of stress and tiredness related to wedding planning."}
+{"id": "te_546__u2__u2", "score": 1.0, "label": "cause", "reason": "Ui directly expresses the same emotion of sadness as Uj, making it a clear self-cause."}
+{"id": "te_546__u1__u3", "score": 0.4, "label": "not_cause", "reason": "Ui shows concern but does not directly contribute to the happiness expressed in Uj."}
+{"id": "te_546__u2__u3", "score": 0.0, "label": "not_cause", "reason": "Ui expresses sadness and stress, which does not contribute to the happiness expressed in Uj."}
+{"id": "te_546__u3__u3", "score": 0.9, "label": "cause", "reason": "Ui directly expresses reassurance and positivity, which naturally evokes happiness."}
+{"id": "te_546__u1__u4", "score": 0.2, "label": "not_cause", "reason": "Ui does not directly relate to the chaos or worry expressed in Uj."}
+{"id": "te_546__u2__u4", "score": 0.5, "label": "cause", "reason": "The expression of being tired and stressed suggests a chaotic situation, which can lead to feelings of fear about the wedding's organization."}
+{"id": "te_546__u3__u4", "score": 0.2, "label": "not_cause", "reason": "Ui expresses reassurance, which does not directly contribute to the fear of chaos expressed in Uj."}
+{"id": "te_546__u4__u4", "score": 1.0, "label": "cause", "reason": "Ui directly expresses the same fear as Uj, making it a clear self-cause."}
+{"id": "te_546__u1__u7", "score": 0.4, "label": "not_cause", "reason": "Ui shows concern but does not directly contribute to the happiness expressed in Uj."}
+{"id": "te_546__u2__u7", "score": 0.4, "label": "not_cause", "reason": "While Ui expresses stress, Uj's happiness is more about reassurance and confidence in handling the situation."}
+{"id": "te_546__u4__u7", "score": 0.3, "label": "not_cause", "reason": "Ui expresses worry, which does not directly contribute to the happiness expressed in Uj."}
+{"id": "te_546__u5__u7", "score": 0.5, "label": "cause", "reason": "Ui provides reassurance about handling the guests, which contributes to the happiness expressed in Uj."}
+{"id": "te_546__u6__u7", "score": 0.5, "label": "cause", "reason": "Ui acknowledges the responsibilities that need to be managed, which can lead to a sense of reassurance and happiness in Uj."}
+{"id": "te_546__u7__u7", "score": 0.9, "label": "cause", "reason": "Ui expresses reassurance and confidence, which directly contributes to the happiness in Uj."}
+{"id": "te_546__u3__u7", "score": 0.6, "label": "cause", "reason": "Ui provides reassurance and support, which can contribute to the happiness expressed in Uj."}
