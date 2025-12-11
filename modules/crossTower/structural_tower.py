@@ -1,4 +1,4 @@
-#!/usr/bin/env python3更屌版本
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Research/IMCEE/modules/crossTower/structural_tower.py
 
@@ -12,7 +12,7 @@ class StructuralGraphTower(nn.Module):
     def __init__(self, 
                  hidden_dim,       # 輸入維度 (通常來自 Text Encoder)
                  internal_dim=768, # RGCN 內部運算維度
-                 num_gnn_layers=3, 
+                 num_gnn_layers=2, 
                  dropout=0.3,      
                  num_relations=6,  # [Updated] 對應新的 dataset.py 定義的 6 種關係
                  num_bases=4,      # Basis Decomposition 以減少參數

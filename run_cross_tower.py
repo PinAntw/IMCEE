@@ -1,737 +1,53 @@
-# #!/usr/bin/env python3
-# # -*- coding: utf-8 -*-
-# # Research/IMCEE/run_cross_tower.py
-
-# import os
-# import json
-# import random
-# import numpy as np
-# from tqdm import tqdm
-# from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
-
-# import torch
-# import torch.nn.functional as F
-# from torch.utils.data import DataLoader
-# from transformers import AutoTokenizer, get_linear_schedule_with_warmup
-
-# # ============================================================
-# # Imports
-# # ============================================================
-# from modules.dataset import CEEEnd2EndDataset, End2EndCollate
-# from modules.crossTower.cross_tower_model import CrossTowerCausalModel
-
-# # ============================================================
-# # 1. Configuration (改用 Class 管理，方便參數分組)
-# # ============================================================
-# class Config:
-#     # ---- 模式設定 ----
-#     RUN_MODE = "test"   # "train" or "test"
-#     SAVE_SUFFIX = "cross_tower_diao"
-#     SEED = 42
-
-#     # ---- 路徑設定 ----
-#     BASE_DIR = "/home/joung/r13725060/Research/IMCEE"
-#     DATA_DIR = os.path.join(BASE_DIR, "data/preprocess")
-#     EXP_DIR  = os.path.join(BASE_DIR, "outputs/Vexplain")
-#     CKPT_DIR = os.path.join(BASE_DIR, "checkpoints/cross_tower")
-
-#     # ---- 模型結構參數 ----
-#     TEXT_MODEL = "roberta-base"
-#     HIDDEN_DIM = 768
-#     GNN_DIM    = 768
-#     NUM_GNN_LAYERS = 3
-    
-#     # ---- Dropout 設定 (區分 GNN 與其他) ----
-#     DROPOUT_BASE = 0.1       # MLP, Projection 用
-#     DROPOUT_GNN  = 0.3       # RGCN 專用 (Paper 建議較高)
-
-#     # ---- 訓練超參數 ----
-#     EPOCHS = 40
-#     BATCH_SIZE = 4
-#     ACCUM_STEPS = 1
-#     PATIENCE = 5
-#     WARMUP_RATIO = 0.1
-#     POS_WEIGHT_MULT = 1.0
-
-#     # ---- 參數凍結與解釋 ----
-#     FREEZE_TEXT = True
-#     USE_EXPLAIN = False   
-
-#     # ---- [關鍵] 學習率分組設定 ----
-#     # 1. 基礎層 (MLP, Semantic Tower)
-#     LR_BASE = 1e-4           
-#     WD_BASE = 1e-4           
-
-#     # 2. RoBERTa (如果解凍的話)
-#     LR_PLM  = 1e-4            
-
-#     # 3. GNN 專屬 (RGCN 通常需要大 LR)
-#     LR_GNN  = 0.01           
-#     WD_GNN  = 0.0            # GNN 通常不需要 weight decay
-
-#     # ---- 自動生成路徑 ----
-#     CONV  = os.path.join(DATA_DIR, "conversations.jsonl")
-#     TRAIN = os.path.join(DATA_DIR, "pairs_train.jsonl")
-#     VALID = os.path.join(DATA_DIR, "pairs_valid.jsonl")
-#     TEST  = os.path.join(DATA_DIR, "pairs_test.jsonl")
-
-#     EX_TRAIN_PT  = os.path.join(EXP_DIR, "explain_train_embeddings.pt")
-#     EX_TRAIN_TSV = os.path.join(EXP_DIR, "explain_train_results_index.tsv")
-#     EX_VALID_PT  = os.path.join(EXP_DIR, "explain_valid_embeddings.pt")
-#     EX_VALID_TSV = os.path.join(EXP_DIR, "explain_valid_results_index.tsv")
-#     EX_TEST_PT   = os.path.join(EXP_DIR, "explain_test_embeddings.pt")
-#     EX_TEST_TSV  = os.path.join(EXP_DIR, "explain_test_results_index.tsv")
-
-#     SAVE_PATH = os.path.join(CKPT_DIR, f"model_{SAVE_SUFFIX}.pt")
-#     OUT_JSON  = os.path.join(BASE_DIR, "outputs", f"test_result_{SAVE_SUFFIX}.json")
-
-# cfg = Config()
-
-# # ============================================================
-# # Utils
-# # ============================================================
-# def set_seed(seed: int):
-#     random.seed(seed)
-#     np.random.seed(seed)
-#     torch.manual_seed(seed)
-#     if torch.cuda.is_available():
-#         torch.cuda.manual_seed(seed)
-#         torch.cuda.manual_seed_all(seed)
-#     torch.backends.cudnn.deterministic = True
-#     torch.backends.cudnn.benchmark = False
-
-# def sigmoid(x):
-#     return 1 / (1 + np.exp(-x))
-
-# def compute_pos_weight_from_dataset(train_dataset):
-#     pos_count, neg_count = 0, 0
-#     for d in train_dataset.data_list:
-#         mask = d.edge_task_mask
-#         if mask.sum() == 0: continue
-#         y = d.edge_labels[mask]
-#         pos_count += (y == 1).sum().item()
-#         neg_count += (y == 0).sum().item()
-#     if pos_count == 0: ratio = 1.0
-#     else: ratio = neg_count / pos_count
-#     return ratio * cfg.POS_WEIGHT_MULT
-
-# # ============================================================
-# # Evaluate
-# # ============================================================
-# @torch.no_grad()
-# def evaluate(model, loader, device, desc="Evaluating"):
-#     model.eval()
-#     all_logits, all_labels = [], []
-
-#     for batch in tqdm(loader, desc=desc):
-#         batch = batch.to(device)
-#         logits = model(batch)
-
-#         task_mask = batch.edge_task_mask
-#         if task_mask.sum() == 0: continue
-#         labels = batch.edge_labels[task_mask].float()
-
-#         if logits.numel() == 0: continue
-
-#         all_logits.append(logits.detach().cpu())
-#         all_labels.append(labels.detach().cpu())
-
-#     if not all_logits: return None
-
-#     all_logits = torch.cat(all_logits).numpy()
-#     all_labels = torch.cat(all_labels).numpy()
-#     all_probs = sigmoid(all_logits)
-
-#     try: auc = roc_auc_score(all_labels, all_probs)
-#     except: auc = 0.5
-
-#     best_res = {"macro_f1": 0.0, "thr": 0.5}
-#     for thr in np.linspace(0.1, 0.9, 9):
-#         preds = (all_probs >= thr).astype(int)
-#         pos_f1 = f1_score(all_labels, preds, pos_label=1, zero_division=0)
-#         neg_f1 = f1_score(all_labels, preds, pos_label=0, zero_division=0)
-#         macro = (pos_f1 + neg_f1) / 2.0
-#         acc = accuracy_score(all_labels, preds)
-
-#         if macro > best_res["macro_f1"]:
-#             best_res = {
-#                 "auc": float(auc),
-#                 "macro_f1": float(macro),
-#                 "pos_f1": float(pos_f1),
-#                 "neg_f1": float(neg_f1),
-#                 "acc": float(acc),
-#                 "thr": float(thr),
-#             }
-#     return best_res
-
-# # ============================================================
-# # Train
-# # ============================================================
-# def train(model, train_loader, valid_loader, loss_fn, optimizer, scheduler, device):
-#     os.makedirs(os.path.dirname(cfg.SAVE_PATH), exist_ok=True)
-#     best_macro = 0.0
-#     no_improve = 0
-
-#     for epoch in range(1, cfg.EPOCHS + 1):
-#         print(f"\n=== Epoch {epoch}/{cfg.EPOCHS} ===")
-#         model.train()
-#         optimizer.zero_grad()
-#         total_loss, total_pairs = 0.0, 0
-
-#         for step, batch in enumerate(tqdm(train_loader, desc=f"Training E{epoch}")):
-#             batch = batch.to(device)
-#             logits = model(batch)
-
-#             task_mask = batch.edge_task_mask
-#             labels = batch.edge_labels[task_mask].float()
-
-#             if logits.numel() == 0: continue
-
-#             loss = loss_fn(logits, labels)
-#             loss = loss / cfg.ACCUM_STEPS
-#             loss.backward()
-
-#             if (step + 1) % cfg.ACCUM_STEPS == 0:
-#                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-#                 optimizer.step()
-#                 scheduler.step()
-#                 optimizer.zero_grad()
-
-#             total_loss += float(loss.item()) * cfg.ACCUM_STEPS * int(labels.size(0))
-#             total_pairs += int(labels.size(0))
-
-#         avg_loss = total_loss / max(1, total_pairs)
-#         print(f"Train loss = {avg_loss:.4f}")
-
-#         val = evaluate(model, valid_loader, device, desc="Validating")
-#         if val is None: 
-#             print("Valid skipped (no data).")
-#             continue
-
-#         print(f"Valid MacroF1: {val['macro_f1']:.4f} (Pos: {val['pos_f1']:.2f}, Neg: {val['neg_f1']:.2f}) | AUC: {val['auc']:.4f}")
-
-#         if val["macro_f1"] > best_macro:
-#             best_macro = val["macro_f1"]
-#             no_improve = 0
-#             torch.save(model.state_dict(), cfg.SAVE_PATH)
-#             print(f"Saved best model -> {cfg.SAVE_PATH}")
-#         else:
-#             no_improve += 1
-#             if no_improve >= cfg.PATIENCE:
-#                 print(f"Early stopping at epoch {epoch}")
-#                 break
-
-# # ============================================================
-# # Main
-# # ============================================================
-# def main():
-#     set_seed(cfg.SEED)
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#     print(f"Device: {device}")
-
-#     tokenizer = AutoTokenizer.from_pretrained(cfg.TEXT_MODEL)
-#     collate_fn = End2EndCollate(tokenizer)
-
-#     if cfg.RUN_MODE == "train":
-#         train_dataset = CEEEnd2EndDataset(cfg.CONV, cfg.TRAIN, cfg.EX_TRAIN_PT, cfg.EX_TRAIN_TSV, use_explain=cfg.USE_EXPLAIN)
-#         valid_dataset = CEEEnd2EndDataset(cfg.CONV, cfg.VALID, cfg.EX_VALID_PT, cfg.EX_VALID_TSV, use_explain=cfg.USE_EXPLAIN)
-
-#         train_loader = DataLoader(train_dataset, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-#         valid_loader = DataLoader(valid_dataset, batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-
-#         expl_dim = train_dataset.get_explain_dim()
-
-#         # 初始化模型：傳入兩種 dropout
-#         model = CrossTowerCausalModel(
-#             text_model_name=cfg.TEXT_MODEL,
-#             hidden_dim=cfg.HIDDEN_DIM,
-#             expl_dim=expl_dim,
-#             num_speakers=train_dataset.num_speakers,
-#             num_emotions=train_dataset.num_emotions,
-#             dropout=cfg.DROPOUT_BASE,         # 一般 dropout
-#             gnn_dropout=cfg.DROPOUT_GNN,      # GNN 專用 dropout
-#             num_gnn_layers=cfg.NUM_GNN_LAYERS,
-#             freeze_text=cfg.FREEZE_TEXT,
-#             use_explain=cfg.USE_EXPLAIN,
-#         ).to(device)
-
-#         # ---- [核心] 參數分組邏輯 ----
-#         plm_ids = list(map(id, model.text_encoder.text_encoder.parameters()))
-#         gnn_ids = list(map(id, model.structural_tower.parameters()))
-        
-#         # Base 參數：不是 PLM 也不是 GNN 的參數 (ex: MLP, Embeddings)
-#         base_params = filter(
-#             lambda p: id(p) not in plm_ids and id(p) not in gnn_ids, 
-#             model.parameters()
-#         )
-
-#         optimizer_grouped_parameters = [
-#             # 1. Base (MLP etc.)
-#             {'params': base_params, 'lr': cfg.LR_BASE, 'weight_decay': cfg.WD_BASE},
-#             # 2. GNN (RGCN)
-#             {'params': model.structural_tower.parameters(), 'lr': cfg.LR_GNN, 'weight_decay': cfg.WD_GNN},
-#             # 3. PLM (RoBERTa)
-#             {'params': model.text_encoder.text_encoder.parameters(), 'lr': cfg.LR_PLM, 'weight_decay': 0.01}
-#         ]
-
-#         optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
-
-#         pos_weight_val = compute_pos_weight_from_dataset(train_dataset)
-#         print(f"Pos Weight: {pos_weight_val:.2f}")
-#         loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_val], device=device))
-
-#         total_steps = len(train_loader) * cfg.EPOCHS
-#         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * cfg.WARMUP_RATIO), num_training_steps=total_steps)
-
-#         train(model, train_loader, valid_loader, loss_fn, optimizer, scheduler, device)
-
-#     else:
-#         # Test Mode
-#         test_dataset = CEEEnd2EndDataset(cfg.CONV, cfg.TEST, cfg.EX_TEST_PT, cfg.EX_TEST_TSV, use_explain=cfg.USE_EXPLAIN)
-#         test_loader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-
-#         expl_dim = test_dataset.get_explain_dim()
-
-#         model = CrossTowerCausalModel(
-#             text_model_name=cfg.TEXT_MODEL,
-#             hidden_dim=cfg.HIDDEN_DIM,
-#             expl_dim=expl_dim,
-#             num_emotions=test_dataset.num_emotions,
-#             num_speakers=test_dataset.num_speakers,
-#             dropout=cfg.DROPOUT_BASE,
-#             gnn_dropout=cfg.DROPOUT_GNN,
-#             num_gnn_layers=cfg.NUM_GNN_LAYERS,
-#             freeze_text=cfg.FREEZE_TEXT,
-#             use_explain=cfg.USE_EXPLAIN,
-#         ).to(device)
-
-#         if os.path.exists(cfg.SAVE_PATH):
-#             model.load_state_dict(torch.load(cfg.SAVE_PATH, map_location=device))
-#             print(f"Loaded checkpoint: {cfg.SAVE_PATH}")
-#         else:
-#             print(f"Checkpoint not found: {cfg.SAVE_PATH}")
-#             return
-
-#         results = evaluate(model, test_loader, device, desc="Testing")
-#         print(json.dumps(results, indent=2))
-#         with open(cfg.OUT_JSON, "w") as f:
-#             json.dump(results, f, indent=2)
-
-# if __name__ == "__main__":
-#     main()
-
-
-# #!/usr/bin/env python3
-# # -*- coding: utf-8 -*-
-# # Research/IMCEE/run_cross_tower.py
-
-# import os
-# import json
-# import random
-# import numpy as np
-# from tqdm import tqdm
-# from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
-
-# import torch
-# import torch.nn.functional as F
-# from torch.utils.data import DataLoader
-# from transformers import AutoTokenizer, get_linear_schedule_with_warmup
-
-# # ============================================================
-# # Imports
-# # ============================================================
-# from modules.dataset import CEEEnd2EndDataset, End2EndCollate
-# from modules.crossTower.cross_tower_model import CrossTowerCausalModel
-
-# # ============================================================
-# # 1. Configuration
-# # ============================================================
-# class Config:
-#     # ---- 模式設定 ----
-#     RUN_MODE = "train"   # "train" or "test"
-#     SAVE_SUFFIX = "cross_tower_expl" 
-#     SEED = 42
-
-#     # ---- 路徑設定 ----
-#     BASE_DIR = "/home/joung/r13725060/Research/IMCEE"
-#     DATA_DIR = os.path.join(BASE_DIR, "data/preprocess")
-#     EXP_DIR  = os.path.join(BASE_DIR, "outputs/Vexplain")
-#     CKPT_DIR = os.path.join(BASE_DIR, "checkpoints/cross_tower")
-
-#     # ---- 模型結構參數 ----
-#     TEXT_MODEL = "roberta-base"
-#     HIDDEN_DIM = 768
-#     GNN_DIM    = 768
-#     NUM_GNN_LAYERS = 3
-    
-#     # ---- Dropout 設定 ----
-#     DROPOUT_BASE = 0.1       
-#     DROPOUT_GNN  = 0.3       
-
-#     # ---- 訓練超參數 ----
-#     EPOCHS = 30
-#     BATCH_SIZE = 4
-#     ACCUM_STEPS = 1
-#     PATIENCE = 10
-#     WARMUP_RATIO = 0.1
-#     POS_WEIGHT_MULT = 1.5
-
-#     # ---- 參數凍結 ----
-#     FREEZE_TEXT = True
-    
-#     # [修改] 加回 USE_EXPLAIN
-#     USE_EXPLAIN = False  # 你可以隨時在這裡切換 True/False
-
-#     # ---- 學習率分組 ----
-#     LR_BASE = 1e-4           
-#     WD_BASE = 1e-4           
-#     LR_PLM  = 1e-4            
-#     LR_GNN  = 0.001           
-#     WD_GNN  = 0.0            
-
-#     # ---- 自動生成路徑 ----
-#     CONV  = os.path.join(DATA_DIR, "conversations.jsonl")
-#     TRAIN = os.path.join(DATA_DIR, "pairs_train.jsonl")
-#     VALID = os.path.join(DATA_DIR, "pairs_valid.jsonl")
-#     TEST  = os.path.join(DATA_DIR, "pairs_test.jsonl")
-
-#     # [修改] 加回解釋檔案路徑
-#     EX_TRAIN_PT  = os.path.join(EXP_DIR, "explain_train_embeddings.pt")
-#     EX_TRAIN_TSV = os.path.join(EXP_DIR, "explain_train_results_index.tsv")
-#     EX_VALID_PT  = os.path.join(EXP_DIR, "explain_valid_embeddings.pt")
-#     EX_VALID_TSV = os.path.join(EXP_DIR, "explain_valid_results_index.tsv")
-#     EX_TEST_PT   = os.path.join(EXP_DIR, "explain_test_embeddings.pt")
-#     EX_TEST_TSV  = os.path.join(EXP_DIR, "explain_test_results_index.tsv")
-
-#     SAVE_PATH = os.path.join(CKPT_DIR, f"model_{SAVE_SUFFIX}.pt")
-#     OUT_JSON  = os.path.join(BASE_DIR, "outputs", f"test_result_{SAVE_SUFFIX}.json")
-
-# cfg = Config()
-
-# # ============================================================
-# # Utils
-# # ============================================================
-# def set_seed(seed: int):
-#     random.seed(seed)
-#     np.random.seed(seed)
-#     torch.manual_seed(seed)
-#     if torch.cuda.is_available():
-#         torch.cuda.manual_seed(seed)
-#         torch.cuda.manual_seed_all(seed)
-#     torch.backends.cudnn.deterministic = True
-#     torch.backends.cudnn.benchmark = False
-
-# def sigmoid(x):
-#     return 1 / (1 + np.exp(-x))
-
-# def compute_pos_weight_from_dataset(train_dataset):
-#     pos_count, neg_count = 0, 0
-#     for d in train_dataset.data_list:
-#         label = d.edge_label.item()
-#         if label == 1: pos_count += 1
-#         else: neg_count += 1
-            
-#     if pos_count == 0: ratio = 1.0
-#     else: ratio = neg_count / pos_count
-#     return ratio * cfg.POS_WEIGHT_MULT
-
-# # ============================================================
-# # Evaluate
-# # ============================================================
-# @torch.no_grad()
-# def evaluate(model, loader, device, desc="Evaluating"):
-#     model.eval()
-#     all_logits, all_labels = [], []
-
-#     for batch in tqdm(loader, desc=desc):
-#         batch = batch.to(device)
-#         logits = model(batch)
-#         labels = batch.edge_label.float()
-
-#         if logits.numel() == 0:
-#             continue
-
-#         all_logits.append(logits.detach().cpu())
-#         all_labels.append(labels.detach().cpu())
-
-#     if not all_logits:
-#         return None
-
-#     all_logits = torch.cat(all_logits).numpy()
-#     all_labels = torch.cat(all_labels).numpy()
-#     all_probs = sigmoid(all_logits)
-
-#     try:
-#         auc = roc_auc_score(all_labels, all_probs)
-#     except:
-#         auc = 0.5
-
-#     # 重點：threshold 掃描更細，特別是 0.01–0.3
-#     thr_candidates = np.concatenate([
-#         np.linspace(0.01, 0.30, 30),
-#         np.linspace(0.35, 0.90, 12)
-#     ])
-
-#     best_macro = {
-#         "auc": float(auc),
-#         "macro_f1": 0.0,
-#         "pos_f1": 0.0,
-#         "neg_f1": 0.0,
-#         "acc": 0.0,
-#         "thr": 0.5,
-#     }
-#     best_pos = {
-#         "auc": float(auc),
-#         "macro_f1": 0.0,
-#         "pos_f1": 0.0,
-#         "neg_f1": 0.0,
-#         "acc": 0.0,
-#         "thr": 0.5,
-#     }
-
-#     for thr in thr_candidates:
-#         preds = (all_probs >= thr).astype(int)
-
-#         pos_f1 = f1_score(all_labels, preds, pos_label=1, zero_division=0)
-#         neg_f1 = f1_score(all_labels, preds, pos_label=0, zero_division=0)
-#         macro = (pos_f1 + neg_f1) / 2.0
-#         acc = accuracy_score(all_labels, preds)
-
-#         if macro > best_macro["macro_f1"]:
-#             best_macro = {
-#                 "auc": float(auc),
-#                 "macro_f1": float(macro),
-#                 "pos_f1": float(pos_f1),
-#                 "neg_f1": float(neg_f1),
-#                 "acc": float(acc),
-#                 "thr": float(thr),
-#             }
-
-#         if pos_f1 > best_pos["pos_f1"]:
-#             best_pos = {
-#                 "auc": float(auc),
-#                 "macro_f1": float(macro),
-#                 "pos_f1": float(pos_f1),
-#                 "neg_f1": float(neg_f1),
-#                 "acc": float(acc),
-#                 "thr": float(thr),
-#             }
-
-#     print(
-#         f"[Eval] Best MacroF1: {best_macro['macro_f1']:.4f} "
-#         f"(Pos={best_macro['pos_f1']:.2f}, Neg={best_macro['neg_f1']:.2f}, "
-#         f"Acc={best_macro['acc']:.4f}, AUC={best_macro['auc']:.4f}, Thr={best_macro['thr']:.2f})"
-#     )
-#     print(
-#         f"[Eval] Best PosF1 : {best_pos['pos_f1']:.4f} "
-#         f"(Macro={best_pos['macro_f1']:.4f}, Neg={best_pos['neg_f1']:.2f}, "
-#         f"Acc={best_pos['acc']:.4f}, AUC={best_pos['auc']:.4f}, Thr={best_pos['thr']:.2f})"
-#     )
-
-#     # 訓練流程就沿用「最佳 MacroF1」這個結果
-#     return best_macro
-
-# # ============================================================
-# # Train
-# # ============================================================
-# def train(model, train_loader, valid_loader, loss_fn, optimizer, scheduler, device):
-#     os.makedirs(os.path.dirname(cfg.SAVE_PATH), exist_ok=True)
-#     best_macro = 0.0
-#     no_improve = 0
-
-#     for epoch in range(1, cfg.EPOCHS + 1):
-#         print(f"\n=== Epoch {epoch}/{cfg.EPOCHS} ===")
-#         model.train()
-#         optimizer.zero_grad()
-#         total_loss, total_pairs = 0.0, 0
-
-#         for step, batch in enumerate(tqdm(train_loader, desc=f"Training E{epoch}")):
-#             batch = batch.to(device)
-#             logits = model(batch)
-#             labels = batch.edge_label.float()
-
-#             if logits.numel() == 0: continue
-
-#             loss = loss_fn(logits, labels)
-#             loss = loss / cfg.ACCUM_STEPS
-#             loss.backward()
-
-#             if (step + 1) % cfg.ACCUM_STEPS == 0:
-#                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-#                 optimizer.step()
-#                 scheduler.step()
-#                 optimizer.zero_grad()
-
-#             total_loss += float(loss.item()) * cfg.ACCUM_STEPS * int(labels.size(0))
-#             total_pairs += int(labels.size(0))
-
-#         avg_loss = total_loss / max(1, total_pairs)
-#         print(f"Train loss = {avg_loss:.4f}")
-
-#         val = evaluate(model, valid_loader, device, desc="Validating")
-#         if val is None: 
-#             print("Valid skipped (no data).")
-#             continue
-
-#         print(f"Valid MacroF1: {val['macro_f1']:.4f} (Pos: {val['pos_f1']:.2f}, Neg: {val['neg_f1']:.2f}) | AUC: {val['auc']:.4f}")
-
-#         if val["macro_f1"] > best_macro:
-#             best_macro = val["macro_f1"]
-#             no_improve = 0
-#             torch.save(model.state_dict(), cfg.SAVE_PATH)
-#             print(f"Saved best model -> {cfg.SAVE_PATH}")
-#         else:
-#             no_improve += 1
-#             if no_improve >= cfg.PATIENCE:
-#                 print(f"Early stopping at epoch {epoch}")
-#                 break
-
-# # ============================================================
-# # Main
-# # ============================================================
-# def main():
-#     set_seed(cfg.SEED)
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#     print(f"Device: {device}")
-
-#     tokenizer = AutoTokenizer.from_pretrained(cfg.TEXT_MODEL)
-#     collate_fn = End2EndCollate(tokenizer)
-
-#     if cfg.RUN_MODE == "train":
-#         # [修改] 傳入 Explain 路徑與 Config 設定
-#         train_dataset = CEEEnd2EndDataset(cfg.CONV, cfg.TRAIN, cfg.EX_TRAIN_PT, cfg.EX_TRAIN_TSV, use_explain=cfg.USE_EXPLAIN)
-#         valid_dataset = CEEEnd2EndDataset(cfg.CONV, cfg.VALID, cfg.EX_VALID_PT, cfg.EX_VALID_TSV, use_explain=cfg.USE_EXPLAIN)
-
-#         train_loader = DataLoader(train_dataset, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-#         valid_loader = DataLoader(valid_dataset, batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-
-#         expl_dim = train_dataset.get_explain_dim()
-
-#         # [修改] 傳入 expl_dim 和 use_explain
-#         model = CrossTowerCausalModel(
-#             text_model_name=cfg.TEXT_MODEL,
-#             hidden_dim=cfg.HIDDEN_DIM,
-#             expl_dim=expl_dim,
-#             num_speakers=train_dataset.num_speakers,
-#             num_emotions=train_dataset.num_emotions,
-#             dropout=cfg.DROPOUT_BASE,         
-#             gnn_dropout=cfg.DROPOUT_GNN,      
-#             num_gnn_layers=cfg.NUM_GNN_LAYERS,
-#             freeze_text=cfg.FREEZE_TEXT,
-#             use_explain=cfg.USE_EXPLAIN, # 傳入 config 設定
-#         ).to(device)
-
-#         # ---- 參數分組邏輯 ----
-#         plm_ids = list(map(id, model.text_encoder.text_encoder.parameters()))
-#         gnn_ids = list(map(id, model.structural_tower.parameters()))
-        
-#         base_params = filter(
-#             lambda p: id(p) not in plm_ids and id(p) not in gnn_ids, 
-#             model.parameters()
-#         )
-
-#         optimizer_grouped_parameters = [
-#             {'params': base_params, 'lr': cfg.LR_BASE, 'weight_decay': cfg.WD_BASE},
-#             {'params': model.structural_tower.parameters(), 'lr': cfg.LR_GNN, 'weight_decay': cfg.WD_GNN},
-#             {'params': model.text_encoder.text_encoder.parameters(), 'lr': cfg.LR_PLM, 'weight_decay': 0.01}
-#         ]
-
-#         optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
-
-#         pos_weight_val = compute_pos_weight_from_dataset(train_dataset)
-#         print(f"Pos Weight: {pos_weight_val:.2f}")
-#         loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_val], device=device))
-
-#         total_steps = len(train_loader) * cfg.EPOCHS
-#         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * cfg.WARMUP_RATIO), num_training_steps=total_steps)
-
-#         train(model, train_loader, valid_loader, loss_fn, optimizer, scheduler, device)
-
-#     else:
-#         # Test Mode
-#         # [修改] 傳入 Explain 路徑
-#         test_dataset = CEEEnd2EndDataset(cfg.CONV, cfg.TEST, cfg.EX_TEST_PT, cfg.EX_TEST_TSV, use_explain=cfg.USE_EXPLAIN)
-#         test_loader = DataLoader(test_dataset, batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-
-#         expl_dim = test_dataset.get_explain_dim()
-
-#         model = CrossTowerCausalModel(
-#             text_model_name=cfg.TEXT_MODEL,
-#             hidden_dim=cfg.HIDDEN_DIM,
-#             expl_dim=expl_dim,
-#             num_emotions=test_dataset.num_emotions,
-#             num_speakers=test_dataset.num_speakers,
-#             dropout=cfg.DROPOUT_BASE,
-#             gnn_dropout=cfg.DROPOUT_GNN,
-#             num_gnn_layers=cfg.NUM_GNN_LAYERS,
-#             freeze_text=cfg.FREEZE_TEXT,
-#             use_explain=cfg.USE_EXPLAIN,
-#         ).to(device)
-
-#         if os.path.exists(cfg.SAVE_PATH):
-#             model.load_state_dict(torch.load(cfg.SAVE_PATH, map_location=device))
-#             print(f"Loaded checkpoint: {cfg.SAVE_PATH}")
-#         else:
-#             print(f"Checkpoint not found: {cfg.SAVE_PATH}")
-#             return
-
-#         results = evaluate(model, test_loader, device, desc="Testing")
-#         print(json.dumps(results, indent=2))
-#         with open(cfg.OUT_JSON, "w") as f:
-#             json.dump(results, f, indent=2)
-
-# if __name__ == "__main__":
-#     main()
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Research/IMCEE/run_cross_tower.py
+# Research/IMCEE/run_cross_tower_gated.py
 
 import os
 import json
 import random
 import numpy as np
 from tqdm import tqdm
-from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
+from sklearn.metrics import f1_score, accuracy_score, roc_auc_score, recall_score
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
-# ============================================================
-# Imports
-# ============================================================
 from modules.dataset import CEEEnd2EndDataset, End2EndCollate
 from modules.crossTower.cross_tower_model import CrossTowerCausalModel
 
 # ============================================================
-# 1. Modular Configuration
+# Configuration
 # ============================================================
-
 class PathConfig:
-    """ 路徑相關設定 """
     BASE_DIR = "/home/joung/r13725060/Research/IMCEE"
     DATA_DIR = os.path.join(BASE_DIR, "data/preprocess")
     EXP_DIR  = os.path.join(BASE_DIR, "outputs/Vexplain")
+    EXP_DIR_GPT  = os.path.join(BASE_DIR, "outputs/Vexplain_gpt")
     CKPT_DIR = os.path.join(BASE_DIR, "checkpoints/cross_tower")
     
-    # 輸出檔名標記
-    SAVE_SUFFIX = "cross_tower_expl_v2"
+    # Filename tag (Gated Version)
+    SAVE_SUFFIX = "cross_tower_gated_layer6_emotionencoder"
     
-    # 自動生成
     CONV_PATH = os.path.join(DATA_DIR, "conversations.jsonl")
     TRAIN_PATH = os.path.join(DATA_DIR, "pairs_train.jsonl")
     VALID_PATH = os.path.join(DATA_DIR, "pairs_valid.jsonl")
     TEST_PATH  = os.path.join(DATA_DIR, "pairs_test.jsonl")
 
-    # Explain Files
     EX_TRAIN_PT  = os.path.join(EXP_DIR, "explain_train_embeddings.pt")
     EX_TRAIN_TSV = os.path.join(EXP_DIR, "explain_train_results_index.tsv")
     EX_VALID_PT  = os.path.join(EXP_DIR, "explain_valid_embeddings.pt")
     EX_VALID_TSV = os.path.join(EXP_DIR, "explain_valid_results_index.tsv")
     EX_TEST_PT   = os.path.join(EXP_DIR, "explain_test_embeddings.pt")
     EX_TEST_TSV  = os.path.join(EXP_DIR, "explain_test_results_index.tsv")
+
+    ES_TRAIN_PT  = os.path.join(EXP_DIR_GPT, "explain_train_embeddings.pt")
+    ES_TRAIN_TSV = os.path.join(EXP_DIR_GPT, "explain_train_gpt4omini_index.tsv")
+    ES_VALID_PT  = os.path.join(EXP_DIR_GPT, "explain_valid_embeddings.pt")
+    ES_VALID_TSV = os.path.join(EXP_DIR_GPT, "explain_valid_gpt4omini_index.tsv")
+    ES_TEST_PT   = os.path.join(EXP_DIR_GPT, "explain_test_embeddings.pt")
+    ES_TEST_TSV  = os.path.join(EXP_DIR_GPT, "explain_test_gpt4omini_index.tsv")
 
     @property
     def SAVE_MODEL_PATH(self):
@@ -741,57 +57,39 @@ class PathConfig:
     def OUT_JSON_PATH(self):
         return os.path.join(self.BASE_DIR, "outputs", f"test_result_{self.SAVE_SUFFIX}.json")
 
-
 class ModelConfig:
-    """ 模型結構超參數 """
     TEXT_MODEL = "roberta-base"
-    FREEZE_TEXT = False
-    
-    # 維度設定
-    HIDDEN_DIM = 768    # 用於 Semantic Tower 和 Fusion 的統一維度
-    
-    # Structural Tower (GNN) 設定
-    NUM_GNN_LAYERS = 3
+    HIDDEN_DIM = 768
+    # TEXT_MODEL = "roberta-large"
+    # HIDDEN_DIM = 1024
+    FREEZE_TEXT = True
+    NUM_GNN_LAYERS = 6
     GNN_DROPOUT    = 0.3
-    
-    # Semantic Tower / General 設定
-    BASE_DROPOUT   = 0.1
-    
-    # 功能開關
-    USE_EXPLAIN = False  # 是否使用外部解釋特徵
-
+    BASE_DROPOUT   = 0.2
+    USE_EXPLAIN = False      # edge-level
+    USE_EXPLAIN_SPACE = True # teacher space (Must be enabled)
 
 class TrainConfig:
-    """ 訓練流程超參數 """
     RUN_MODE = "train"   # "train" or "test"
     SEED = 42
-    
     EPOCHS = 30
     BATCH_SIZE = 4
     ACCUM_STEPS = 1
-    PATIENCE = 30
+    PATIENCE = 5
     WARMUP_RATIO = 0.1
+    POS_WEIGHT_MULT = 1
     
-    # Loss Weight
-    POS_WEIGHT_MULT = 1.5
-
+    # Distillation weight
+    LAMBDA_EXPL = 1.0   
 
 class OptimConfig:
-    """ 優化器與學習率設定 (不同模組不同 LR) """
-    # 基礎層 (MLP, Linear 等)
     LR_BASE = 1e-4
     WD_BASE = 1e-4
-    
-    # PLM 層 (Text Encoder)
-    LR_PLM  = 1e-5     # 通常 PLM 學習率要比其他層低
+    LR_PLM  = 3e-6
     WD_PLM  = 0.01
-    
-    # GNN 層 (Structural Tower)
-    LR_GNN  = 1e-3     # GNN 可以稍大
+    LR_GNN  = 1e-3
     WD_GNN  = 0.0
 
-
-# 整合 Config
 class Config:
     path = PathConfig()
     model = ModelConfig()
@@ -799,7 +97,6 @@ class Config:
     optim = OptimConfig()
 
 cfg = Config()
-
 
 # ============================================================
 # Utils
@@ -814,57 +111,223 @@ def set_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def sigmoid(x):
-    return 1 / (1 + np.exp(-x))
-
 def compute_pos_weight_from_dataset(train_dataset):
     pos_count, neg_count = 0, 0
     for d in train_dataset.data_list:
-        label = d.edge_label.item()
-        if label == 1: pos_count += 1
-        else: neg_count += 1
-            
-    if pos_count == 0: ratio = 1.0
-    else: ratio = neg_count / pos_count
+        if d.edge_label.item() == 1:
+            pos_count += 1
+        else:
+            neg_count += 1
+    ratio = neg_count / pos_count if pos_count > 0 else 1.0
     return ratio * cfg.train.POS_WEIGHT_MULT
+
+def calculate_pair_distance(batch):
+    """
+    Calculates the true utterance distance for each Cause-Target pair in the batch.
+    batch.target_node_indices: [B, 2] -> [cause_node_idx, target_node_idx]
+    batch.edge_index: [2, E]
+    """
+    # 1) 優先用 dataset 提供的 mapping（最穩定）
+    if hasattr(batch, "pair_uttpos") and batch.pair_uttpos is not None:
+        pos = batch.pair_uttpos  # [B, 2]
+        d = (pos[:, 1] - pos[:, 0]).abs()
+        return d.detach().cpu().numpy()
+    
+    batch_dists = []
+    
+    cause_nodes = batch.target_node_indices[:, 0]
+    target_nodes = batch.target_node_indices[:, 1]
+    
+    edge_src = batch.edge_index[0]
+    edge_tgt = batch.edge_index[1]
+    
+    for i in range(len(cause_nodes)):
+        c_node = cause_nodes[i].item()
+        t_node = target_nodes[i].item()
+        
+        # 1. Find the real Utterance Index connected to Cause Node
+        # Dataset graph logic: CauseNode -> CauseUtt (Type 0)
+        # Find edge_tgt where edge_src == c_node
+        mask_c = (edge_src == c_node)
+        if mask_c.any():
+            c_utt_idx = edge_tgt[mask_c].min().item()
+        else:
+            c_utt_idx = 0
+            
+        # 2. Find the real Utterance Index connected to Target Node
+        mask_t = (edge_src == t_node)
+        if mask_t.any():
+            t_utt_idx = edge_tgt[mask_t].min().item()
+        else:
+            t_utt_idx = 0
+            
+        dist = abs(t_utt_idx - c_utt_idx)
+        batch_dists.append(dist)
+        
+    return np.array(batch_dists)
+
+# ============================================================
+# Analysis Function (Updated with Pos/Neg F1)
+# ============================================================
+def analyze_distance_performance(preds, labels, dists):
+    """
+    Detailed accuracy analysis for different distances
+    Includes Pos F1 and Neg F1 specifically.
+    """
+    dists = np.array(dists)
+    preds = np.array(preds)
+    labels = np.array(labels)
+    
+    # 表格拉寬一點以容納更多欄位
+    print("\n" + "="*80)
+    print("   MODEL PREDICTION - DISTANCE BREAKDOWN")
+    print("="*80)
+    # Header 加上 PosF1 和 NegF1
+    print(f"{'Dist':<5} | {'Count':<6} | {'PosRate':<8} | {'Acc':<8} | {'PosF1':<8} | {'NegF1':<8} | {'Recall':<8}")
+    print("-" * 80)
+    
+    targets = [0, 1, 2, 3, 4,5,6,7,8]
+    
+    for d in targets:
+        mask = (dists == d)
+        sub_preds = preds[mask]
+        sub_labels = labels[mask]
+        
+        count = len(sub_labels)
+        
+        if count == 0:
+            print(f"{d:<5} | {0:<6} | {'N/A':<8} | {'N/A':<8} | {'N/A':<8} | {'N/A':<8} | {'N/A':<8}")
+            continue
+        
+        pos_rate = np.mean(sub_labels)
+        acc = accuracy_score(sub_labels, sub_preds)
+        
+        # [新增] 分別計算 Positive (1) 和 Negative (0) 的 F1
+        pos_f1 = f1_score(sub_labels, sub_preds, zero_division=0, pos_label=1)
+        neg_f1 = f1_score(sub_labels, sub_preds, zero_division=0, pos_label=0)
+        
+        # Recall (針對 Pos)
+        rec = recall_score(sub_labels, sub_preds, zero_division=0, pos_label=1)
+        
+        print(f"{d:<5} | {count:<6} | {pos_rate:.2f}     | {acc:.4f}   | {pos_f1:.4f}   | {neg_f1:.4f}   | {rec:.4f}")
+
+    # 針對長距離 (>= 5)
+    mask_long = (dists >= 5)
+    sub_preds_long = preds[mask_long]
+    sub_labels_long = labels[mask_long]
+    count_long = len(sub_labels_long)
+    
+    if count_long > 0:
+        pos_rate = np.mean(sub_labels_long)
+        acc = accuracy_score(sub_labels_long, sub_preds_long)
+        pos_f1 = f1_score(sub_labels_long, sub_preds_long, zero_division=0, pos_label=1)
+        neg_f1 = f1_score(sub_labels_long, sub_preds_long, zero_division=0, pos_label=0)
+        rec = recall_score(sub_labels_long, sub_preds_long, zero_division=0, pos_label=1)
+        
+        print(f"{'>=5':<5} | {count_long:<6} | {pos_rate:.2f}     | {acc:.4f}   | {pos_f1:.4f}   | {neg_f1:.4f}   | {rec:.4f}")
+    else:
+        print(f"{'>=5':<5} | {0:<6} | {'N/A':<8} | {'N/A':<8} | {'N/A':<8} | {'N/A':<8} | {'N/A':<8}")
+
+    print("-" * 80)
+# ============================================================
+# Monitor Function (Gated Version)
+# ============================================================
+def monitor_gated_stats(model, loader, device, desc="Monitoring", max_batches=50):
+    model.eval()
+
+    cosine_sim = torch.nn.CosineSimilarity(dim=-1)
+
+    # 分開統計：有 gate 才算 gate_n；有 teacher/student 才算 sim_n
+    gate_sum, gate_n = 0.0, 0
+    sim_sum,  sim_n  = 0.0, 0
+    seen = 0
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc=desc):
+            batch = batch.to(device)
+
+            out = model(batch, return_aux=True)
+            if isinstance(out, tuple) and len(out) == 2:
+                _, aux = out
+            else:
+                # 防呆：如果 return_aux 沒回 (logits, aux)
+                aux = {}
+
+            gate = aux.get("gate", None)
+            if gate is not None:
+                gate_sum += gate.mean().item()
+                gate_n += 1
+
+            z_stud = aux.get("z_student", None)
+            z_teach = aux.get("z_teacher", None)
+            if z_stud is not None and z_teach is not None:
+                sim_sum += cosine_sim(z_stud, z_teach).mean().item()
+                sim_n += 1
+
+            seen += 1
+            if seen >= max_batches:
+                break
+
+    print(f"\n[Gated Monitor] Stats over {seen} batches:")
+    if gate_n > 0:
+        print(f"  > Gate Openness: {gate_sum / gate_n:.4f} (0=Closed, 1=Open) [gate_batches={gate_n}]")
+    else:
+        print(f"  > Gate Openness: N/A (no gate found)")
+
+    if sim_n > 0:
+        print(f"  > S-T Alignment: {sim_sum / sim_n:.4f} (Cosine Sim, -1~1) [align_batches={sim_n}]")
+    else:
+        print(f"  > S-T Alignment: N/A (no teacher/student found)")
+
+    print("-" * 40)
+
 
 # ============================================================
 # Evaluate
 # ============================================================
 @torch.no_grad()
-def evaluate(model, loader, device, desc="Evaluating"):
+def evaluate(model, loader, device, desc="Evaluating", return_dist_stats=False):
     model.eval()
     all_logits, all_labels = [], []
+    all_dists = []
 
     for batch in tqdm(loader, desc=desc):
         batch = batch.to(device)
-        logits = model(batch)
-        labels = batch.edge_label.float()
+        out = model(batch)
+        
+        if isinstance(out, tuple): 
+            logits = out[0]
+        else: 
+            logits = out
 
-        if logits.numel() == 0:
-            continue
+        labels = batch.edge_label.float()
+        if logits.numel() == 0: continue
 
         all_logits.append(logits.detach().cpu())
         all_labels.append(labels.detach().cpu())
+        
+        if return_dist_stats:
+            dists = calculate_pair_distance(batch)
+            all_dists.extend(dists)
 
-    if not all_logits:
-        return None
+    if not all_logits: return None
 
-    all_logits = torch.cat(all_logits).numpy()
-    all_labels = torch.cat(all_labels).numpy()
-    all_probs = sigmoid(all_logits)
+    # 合併 batch logits/labels（仍保留 torch tensor）
+    all_logits_t = torch.cat(all_logits)            # torch.Tensor on CPU (你前面已 .cpu() append)
+    all_labels_t = torch.cat(all_labels)
+    all_probs  = torch.sigmoid(all_logits_t).cpu().numpy()
+    all_labels = all_labels_t.cpu().numpy()
 
     try:
         auc = roc_auc_score(all_labels, all_probs)
     except:
         auc = 0.5
 
-    thr_candidates = np.concatenate([
-        np.linspace(0.01, 0.30, 30),
-        np.linspace(0.35, 0.90, 12)
-    ])
+    best_res = {"auc": float(auc), "macro_f1": 0.0, "thr": 0.5}
+    thr_candidates = np.concatenate([np.linspace(0.01, 0.30, 30), np.linspace(0.35, 0.90, 12)])
 
-    best_macro = {"auc": float(auc), "macro_f1": 0.0, "thr": 0.5}
+    # Find Best Threshold
+    final_preds = None
     
     for thr in thr_candidates:
         preds = (all_probs >= thr).astype(int)
@@ -873,22 +336,30 @@ def evaluate(model, loader, device, desc="Evaluating"):
         macro = (pos_f1 + neg_f1) / 2.0
         acc = accuracy_score(all_labels, preds)
 
-        if macro > best_macro["macro_f1"]:
-            best_macro = {
-                "auc": float(auc),
+        if macro > best_res["macro_f1"]:
+            best_res = {
                 "macro_f1": float(macro),
                 "pos_f1": float(pos_f1),
                 "neg_f1": float(neg_f1),
                 "acc": float(acc),
+                "auc": float(auc),
                 "thr": float(thr),
             }
+            # Keep best preds for analysis
+            if return_dist_stats:
+                final_preds = preds
 
     print(
-        f"[Eval] Best MacroF1: {best_macro['macro_f1']:.4f} "
-        f"(Pos={best_macro['pos_f1']:.2f}, Neg={best_macro['neg_f1']:.2f}, "
-        f"Acc={best_macro['acc']:.4f}, AUC={best_macro['auc']:.4f})"
+        f"[Eval] Best MacroF1: {best_res['macro_f1']:.4f} "
+        f"(Pos={best_res['pos_f1']:.2f}, Neg={best_res['neg_f1']:.2f}, "
+        f"Acc={best_res['acc']:.4f}, AUC={best_res['auc']:.4f})"
     )
-    return best_macro
+    
+    # Distance Breakdown (Only if requested)
+    if return_dist_stats and final_preds is not None:
+        analyze_distance_performance(final_preds, all_labels, all_dists)
+        
+    return best_res
 
 # ============================================================
 # Train
@@ -897,21 +368,37 @@ def train(model, train_loader, valid_loader, loss_fn, optimizer, scheduler, devi
     os.makedirs(os.path.dirname(cfg.path.SAVE_MODEL_PATH), exist_ok=True)
     best_macro = 0.0
     no_improve = 0
+    distill_loss_fn = torch.nn.CosineEmbeddingLoss(margin=0.0)
 
     for epoch in range(1, cfg.train.EPOCHS + 1):
         print(f"\n=== Epoch {epoch}/{cfg.train.EPOCHS} ===")
         model.train()
         optimizer.zero_grad()
-        total_loss, total_pairs = 0.0, 0
+
+        total_loss, total_task, total_expl = 0.0, 0.0, 0.0
+        total_pairs = 0
 
         for step, batch in enumerate(tqdm(train_loader, desc=f"Training E{epoch}")):
             batch = batch.to(device)
-            logits = model(batch)
-            labels = batch.edge_label.float()
+            out = model(batch)
+            if isinstance(out, tuple) and len(out) == 3:
+                logits, z_stud, z_teach = out
+            else:
+                logits, z_stud, z_teach = out, None, None
 
+            labels = batch.edge_label.float()
             if logits.numel() == 0: continue
 
-            loss = loss_fn(logits, labels)
+            task_loss = loss_fn(logits, labels)
+            
+            if cfg.model.USE_EXPLAIN_SPACE and z_stud is not None and z_teach is not None:
+                target = torch.ones(z_stud.size(0)).to(device)
+                expl_loss = distill_loss_fn(z_stud, z_teach, target)
+            else:
+                expl_loss = torch.tensor(0.0, device=device)
+            # expl_loss = torch.tensor(0.0, device=device)
+
+            loss = task_loss + cfg.train.LAMBDA_EXPL * expl_loss
             loss = loss / cfg.train.ACCUM_STEPS
             loss.backward()
 
@@ -921,27 +408,33 @@ def train(model, train_loader, valid_loader, loss_fn, optimizer, scheduler, devi
                 scheduler.step()
                 optimizer.zero_grad()
 
-            total_loss += float(loss.item()) * cfg.train.ACCUM_STEPS * int(labels.size(0))
-            total_pairs += int(labels.size(0))
+            bs = int(labels.size(0))
+            total_loss += loss.item() * cfg.train.ACCUM_STEPS * bs
+            total_task += task_loss.item() * bs
+            total_expl += expl_loss.item() * bs
+            total_pairs += bs
 
-        avg_loss = total_loss / max(1, total_pairs)
-        print(f"Train loss = {avg_loss:.4f}")
+        print(f"Train loss={total_loss/total_pairs:.4f} (task={total_task/total_pairs:.4f}, expl={total_expl/total_pairs:.4f})")
 
-        val = evaluate(model, valid_loader, device, desc="Validating")
-        if val is None: 
-            print("Valid skipped.")
-            continue
+        # Evaluate (Normal)
+        val = evaluate(model, valid_loader, device)
+        monitor_gated_stats(model, valid_loader, device)
 
-        if val["macro_f1"] > best_macro:
+        is_best = False
+        if val and val["macro_f1"] > best_macro:
             best_macro = val["macro_f1"]
+            is_best = True
             no_improve = 0
             torch.save(model.state_dict(), cfg.path.SAVE_MODEL_PATH)
             print(f"Saved best model -> {cfg.path.SAVE_MODEL_PATH}")
         else:
             no_improve += 1
-            if no_improve >= cfg.train.PATIENCE:
-                print(f"Early stopping at epoch {epoch}")
-                break
+        
+        print(f"Current Epoch: {val['macro_f1']:.4f} | >>> Global Best MacroF1: {best_macro:.4f} <<<")
+
+        if not is_best and no_improve >= cfg.train.PATIENCE:
+            print("Early stopping.")
+            break
 
 # ============================================================
 # Main
@@ -954,106 +447,90 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.TEXT_MODEL)
     collate_fn = End2EndCollate(tokenizer)
 
-    # ---------------------------------------------------------
-    # Training Mode
-    # ---------------------------------------------------------
     if cfg.train.RUN_MODE == "train":
-        print(">>> Loading Datasets...")
         train_dataset = CEEEnd2EndDataset(
-            cfg.path.CONV_PATH, cfg.path.TRAIN_PATH, 
-            cfg.path.EX_TRAIN_PT, cfg.path.EX_TRAIN_TSV, 
-            use_explain=cfg.model.USE_EXPLAIN
+            cfg.path.CONV_PATH, cfg.path.TRAIN_PATH,
+            cfg.path.EX_TRAIN_PT, cfg.path.EX_TRAIN_TSV,
+            use_explain=cfg.model.USE_EXPLAIN,
+            expl_space_pt=cfg.path.ES_TRAIN_PT, expl_space_tsv=cfg.path.ES_TRAIN_TSV,
+            use_expl_space=cfg.model.USE_EXPLAIN_SPACE,
         )
         valid_dataset = CEEEnd2EndDataset(
-            cfg.path.CONV_PATH, cfg.path.VALID_PATH, 
-            cfg.path.EX_VALID_PT, cfg.path.EX_VALID_TSV, 
-            use_explain=cfg.model.USE_EXPLAIN
+            cfg.path.CONV_PATH, cfg.path.VALID_PATH,
+            cfg.path.EX_VALID_PT, cfg.path.EX_VALID_TSV,
+            use_explain=cfg.model.USE_EXPLAIN,
+            expl_space_pt=cfg.path.ES_VALID_PT, expl_space_tsv=cfg.path.ES_VALID_TSV,
+            use_expl_space=cfg.model.USE_EXPLAIN_SPACE,
         )
-
         train_loader = DataLoader(train_dataset, batch_size=cfg.train.BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
         valid_loader = DataLoader(valid_dataset, batch_size=cfg.train.BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
-        expl_dim = train_dataset.get_explain_dim()
-
-        print(">>> Initializing Model...")
         model = CrossTowerCausalModel(
             text_model_name=cfg.model.TEXT_MODEL,
             hidden_dim=cfg.model.HIDDEN_DIM,
-            expl_dim=expl_dim,
+            expl_dim=train_dataset.get_explain_dim(),
             num_speakers=train_dataset.num_speakers,
             num_emotions=train_dataset.num_emotions,
             dropout=cfg.model.BASE_DROPOUT,
-            # GNN Settings (目前 CrossTowerCausalModel 只接了 dropout, 你可能要修改模型接收 gnn_dropout)
-            # 這裡假設你的模型已經有接收 gnn_dropout 的邏輯，如果沒有請在模型 init 加
+            gnn_dropout=cfg.model.GNN_DROPOUT,
             num_gnn_layers=cfg.model.NUM_GNN_LAYERS,
             freeze_text=cfg.model.FREEZE_TEXT,
             use_explain=cfg.model.USE_EXPLAIN,
+            expl_space_dim=train_dataset.get_expl_space_dim(),
+            use_expl_space=cfg.model.USE_EXPLAIN_SPACE,
         ).to(device)
 
-        # ---- Optimizer Grouping (根據 Config 設定) ----
         plm_ids = list(map(id, model.text_encoder.text_encoder.parameters()))
         gnn_ids = list(map(id, model.structural_tower.parameters()))
-        
-        base_params = filter(
-            lambda p: id(p) not in plm_ids and id(p) not in gnn_ids, 
-            model.parameters()
-        )
+        base_params = filter(lambda p: id(p) not in plm_ids and id(p) not in gnn_ids, model.parameters())
 
-        optimizer_grouped_parameters = [
+        optimizer = torch.optim.AdamW([
             {'params': base_params, 'lr': cfg.optim.LR_BASE, 'weight_decay': cfg.optim.WD_BASE},
             {'params': model.structural_tower.parameters(), 'lr': cfg.optim.LR_GNN, 'weight_decay': cfg.optim.WD_GNN},
-            {'params': model.text_encoder.text_encoder.parameters(), 'lr': cfg.optim.LR_PLM, 'weight_decay': cfg.optim.WD_PLM}
-        ]
+            {'params': model.text_encoder.text_encoder.parameters(), 'lr': cfg.optim.LR_PLM, 'weight_decay': cfg.optim.WD_PLM},
+        ])
 
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
+        pos_weight = compute_pos_weight_from_dataset(train_dataset)
+        loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
         
-        pos_weight_val = compute_pos_weight_from_dataset(train_dataset)
-        print(f"Pos Weight: {pos_weight_val:.2f}")
-        loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_val], device=device))
-
         total_steps = len(train_loader) * cfg.train.EPOCHS
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, 
-            num_warmup_steps=int(total_steps * cfg.train.WARMUP_RATIO), 
-            num_training_steps=total_steps
-        )
+        scheduler = get_linear_schedule_with_warmup(optimizer, int(total_steps * cfg.train.WARMUP_RATIO), total_steps)
 
         train(model, train_loader, valid_loader, loss_fn, optimizer, scheduler, device)
 
-    # ---------------------------------------------------------
-    # Testing Mode
-    # ---------------------------------------------------------
-    else:
-        print(">>> Test Mode")
+    else: # TEST
         test_dataset = CEEEnd2EndDataset(
-            cfg.path.CONV_PATH, cfg.path.TEST_PATH, 
-            cfg.path.EX_TEST_PT, cfg.path.EX_TEST_TSV, 
-            use_explain=cfg.model.USE_EXPLAIN
+            cfg.path.CONV_PATH, cfg.path.TEST_PATH,
+            cfg.path.EX_TEST_PT, cfg.path.EX_TEST_TSV,
+            use_explain=cfg.model.USE_EXPLAIN,
+            expl_space_pt=cfg.path.ES_TEST_PT, expl_space_tsv=cfg.path.ES_TEST_TSV,
+            use_expl_space=cfg.model.USE_EXPLAIN_SPACE,
         )
         test_loader = DataLoader(test_dataset, batch_size=cfg.train.BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-        
-        expl_dim = test_dataset.get_explain_dim()
 
         model = CrossTowerCausalModel(
             text_model_name=cfg.model.TEXT_MODEL,
             hidden_dim=cfg.model.HIDDEN_DIM,
-            expl_dim=expl_dim,
+            expl_dim=test_dataset.get_explain_dim(),
             num_speakers=test_dataset.num_speakers,
             num_emotions=test_dataset.num_emotions,
             dropout=cfg.model.BASE_DROPOUT,
+            gnn_dropout=cfg.model.GNN_DROPOUT,
             num_gnn_layers=cfg.model.NUM_GNN_LAYERS,
             freeze_text=cfg.model.FREEZE_TEXT,
             use_explain=cfg.model.USE_EXPLAIN,
+            expl_space_dim=test_dataset.get_expl_space_dim(),
+            use_expl_space=cfg.model.USE_EXPLAIN_SPACE,
         ).to(device)
 
         if os.path.exists(cfg.path.SAVE_MODEL_PATH):
             model.load_state_dict(torch.load(cfg.path.SAVE_MODEL_PATH, map_location=device))
-            print(f"Loaded checkpoint: {cfg.path.SAVE_MODEL_PATH}")
-        else:
-            print(f"Checkpoint not found: {cfg.path.SAVE_MODEL_PATH}")
-            return
+            print(f"Loaded: {cfg.path.SAVE_MODEL_PATH}")
+        
+        monitor_gated_stats(model, test_loader, device, desc="Monitoring Test")
 
-        results = evaluate(model, test_loader, device, desc="Testing")
+        # [Modified]: Enable distance stats for Test
+        results = evaluate(model, test_loader, device, desc="Testing", return_dist_stats=True)
         print(json.dumps(results, indent=2))
         with open(cfg.path.OUT_JSON_PATH, "w") as f:
             json.dump(results, f, indent=2)
