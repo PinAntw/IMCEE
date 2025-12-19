@@ -24,12 +24,12 @@ from modules.crossTower.cross_tower_model import CrossTowerCausalModel
 # ============================================================
 class PathConfig:
     BASE_DIR = "/home/joung/r13725060/Research/IMCEE"
-    EXP_DIR  = os.path.join(BASE_DIR, "outputs/Vexplain")
-    EXP_DIR_GPT  = os.path.join(BASE_DIR, "outputs/Vexplain_gpt")
+    EXP_DIR  = os.path.join(BASE_DIR, "data/Vexplain")
+    EXP_DIR_GPT  = os.path.join(BASE_DIR, "data/Vexplain_gpt")
     CKPT_DIR = os.path.join(BASE_DIR, "checkpoints/cross_tower")
     
     # [新增] 用於存放 LLM 文字解釋與標籤的路徑
-    GPT_TEXT_DIR = os.path.join(BASE_DIR, "outputs/plaintext_gpt4omini")
+    GPT_TEXT_DIR = os.path.join(BASE_DIR, "data/plaintext_gpt4omini")
 
     # Filename tag (Gated Version)
     SAVE_SUFFIX = "justtest"

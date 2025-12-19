@@ -20,3 +20,5 @@ modules/emotion/
 modules/node_explain/
 modules/tag/
 outputs/
+data/Vexplain/
+data/Vexplain_gpt/
