@@ -25,10 +25,10 @@ class StructuralGraphTower(nn.Module):
 
         # -----------------------------------------------------------
         # Relation Types Mapping (Based on Dataset V7):
-        # 0: Classification (CauseNode <-> Utt, TargetNode <-> Utt)
+        # 0: utt -> super anchoring
         # 1: Temporal Dist 1 (相鄰)
         # 2: Temporal Dist 2 (隔一句)
-        # 3: Temporal Dist > 2 (遠距離)
+        # 3: Type 3：context window edges（preceding utt -> super, w=4）
         # 4: Speaker Edge (同說話者)
         # 5: Global Edge (Conversation Node <-> All Utts)
         # -----------------------------------------------------------

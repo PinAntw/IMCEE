@@ -1,299 +1,304 @@
 # Research/IMCEE/modules/crossTower/text_encoder.py
-# !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import torch
 import torch.nn as nn
-from transformers import AutoModel
 import torch.nn.functional as F
+from transformers import AutoModel
+
 
 class TextNodeEncoder(nn.Module):
     """
-    Early Fusion Text Encoder (With Projection)
-    功能: RoBERTa + Spk + Emo -> Concat -> Linear(768) -> Contextual MHSA
-    輸出: [N, d_text (768)]
+    Early Fusion Document Encoder (CFIB-Style + Token Injection)
+    + SuperNode Safe Init + (Optional) MPEG-style init for cause/target + conv mean init
+
+    Node ordering per graph:
+      0..num_utts-1 : utterance nodes
+      num_utts      : conv node
+      num_utts+1    : cause super node
+      num_utts+2    : target super node
+
+    Collate inputs:
+      input_ids_padded      [B, S_nodes, T]
+      token_mask_padded     [B, S_nodes, T]
+      utterance_mask        [B, S_nodes]   (實際為 node_mask)
+      speaker_ids_padded    [B, S_nodes]
+      emotion_ids_padded    [B, S_nodes]
+      pair_utt_index        [B, 2]         (c_idx, t_idx) in utterance-local indices
+
+    Key behavior:
+      - Only utterance nodes run PLM (with speaker/emotion token injection)
+      - Super nodes do NOT run PLM
+      - Super nodes default init: learnable embeddings (conv/cause/target)
+      - If pair_utt_index provided: cause/target init from corresponding utterance vectors (MPEG-style)
+      - conv init (recommended): mean of valid utterance vectors (if any), else fallback to learnable conv
+      - Robust truncation: truncate to safe_len then pad back + sync mask to avoid pooling on padded zeros
+      - Output aligned with PyG Batch node ordering (do not drop nodes)
     """
-    def __init__(self, text_model_name, num_speakers, num_emotions, 
-                 spk_dim=64, emo_dim=64, freeze_text=True, dropout=0.1):
+
+    def __init__(
+        self,
+        text_model_name,
+        num_speakers,
+        num_emotions,
+        spk_dim=None,  # keep for compatibility (unused)
+        emo_dim=None,  # keep for compatibility (unused)
+        freeze_text=True,
+        dropout=0.1,
+        num_heads=8,
+    ):
         super().__init__()
-        
-        # 1. Text Model
+
+        print(f"[TextNodeEncoder] Loading PLM: {text_model_name}...")
         self.text_encoder = AutoModel.from_pretrained(text_model_name)
+        self.d_sem = int(self.text_encoder.config.hidden_size)
+        print(f"[TextNodeEncoder] Detected hidden_size: {self.d_sem}")
+
         if freeze_text:
+            print("[TextNodeEncoder] Freezing PLM parameters.")
             for p in self.text_encoder.parameters():
                 p.requires_grad = False
-        
-        self.d_sem = self.text_encoder.config.hidden_size # 768
 
-        # 2. Embeddings
-        self.spk_embed = nn.Embedding(num_speakers, spk_dim)
-        self.emo_embed = nn.Embedding(num_emotions, emo_dim)
+        # Speaker / Emotion token injection embedding (must match hidden_size)
+        self.spk_embed = nn.Embedding(num_speakers, self.d_sem)
+        self.emo_embed = nn.Embedding(num_emotions, self.d_sem)
 
-        # 3. Fusion Projection (896 -> 768)
-        # 這裡將 Concat 後的特徵融合並降維，讓 MHSA 在標準維度上運作
-        fusion_in_dim = self.d_sem + spk_dim + emo_dim
-        
-        self.fusion_proj = nn.Sequential(
-            nn.Linear(fusion_in_dim, self.d_sem),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
+        # CFIB-style attention pooling (token-level -> utterance vector)
+        self.attn_score = nn.Linear(self.d_sem, 1)
 
-        # 4. Contextual MHSA (維度變回 768)
+        # utterance-level MHSA refine (only on utterances)
         self.mhsa = nn.MultiheadAttention(
-            embed_dim=self.d_sem, 
-            num_heads=8, 
-            dropout=dropout, 
-            batch_first=True
+            embed_dim=self.d_sem,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
         )
-
         self.norm = nn.LayerNorm(self.d_sem)
+        self.dropout = nn.Dropout(dropout)
 
-    def _mean_pool(self, hidden, mask):
-        # hidden: [B*S, T, d], mask: [B*S, T]
-        mask = mask.unsqueeze(-1)           # [B*S, T, 1]
-        hidden = hidden * mask
-        summed = hidden.sum(1)              # [B*S, d]
-        count = mask.sum(1).clamp(min=1e-9)
-        return summed / count               # [B*S, d]
+        # Learnable fallback init for 3 super nodes: conv/cause/target
+        # 0=conv, 1=cause, 2=target
+        self.super_node_embed = nn.Embedding(3, self.d_sem)
 
-    def forward(self, input_ids_padded, token_mask_padded, utterance_mask, 
-                speaker_ids_padded, emotion_ids_padded):
+    # ------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------
+    @staticmethod
+    def _ensure_bool_mask(mask: torch.Tensor) -> torch.Tensor:
+        if mask.dtype == torch.bool:
+            return mask
+        return mask > 0
+
+    def _get_safe_len(self) -> int:
+        max_pos = int(getattr(self.text_encoder.config, "max_position_embeddings", 512))
+        model_type = str(getattr(self.text_encoder.config, "model_type", "")).lower()
+        offset = 2 if model_type in {"roberta", "xlm-roberta"} else 0
+        return max(1, max_pos - offset)
+
+    def _attention_pool(self, hidden: torch.Tensor, mask_bool: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            input_ids_padded:   [B, S, T]
-            token_mask_padded:  [B, S, T]
-            utterance_mask:     [B, S]
-            speaker_ids_padded: [B, S]
-            emotion_ids_padded: [B, S]
-        Returns:
-            h_text_nodes: [N, 768]
+        hidden:    [B, U, L, d]
+        mask_bool: [B, U, L]  True=有效 token
+        return:    [B, U, d]
         """
-        B, S, T = input_ids_padded.shape
+        attn_logits = self.attn_score(hidden)  # [B,U,L,1]
+        attn_logits = attn_logits.masked_fill(~mask_bool.unsqueeze(-1), -1e9)
+        alpha = F.softmax(attn_logits, dim=2)  # [B,U,L,1]
+        pooled = torch.sum(alpha * hidden, dim=2)  # [B,U,d]
+        return pooled
 
-        # 1. RoBERTa Encoding
-        outputs = self.text_encoder(
-            input_ids=input_ids_padded.view(B * S, T),
-            attention_mask=token_mask_padded.view(B * S, T),
-        )[0]
+    def _plm_forward_with_trunc_and_mask_sync(
+        self,
+        flat_inputs_embeds: torch.Tensor,  # [B, total_len, d]
+        flat_mask_bool: torch.Tensor,      # [B, total_len] bool
+    ):
+        """
+        If total_len > safe_len: feed first safe_len to PLM.
+        If padding back: pad outputs with zeros AND pad mask with False.
+        """
+        B, total_len, D = flat_inputs_embeds.shape
+        safe_len = self._get_safe_len()
+        kept_len = min(total_len, safe_len)
 
-        h_text_utt = self._mean_pool(
-            outputs,
-            token_mask_padded.view(B * S, T)
-        )  
-        h_text_utt = h_text_utt.view(B, S, -1) # [B, S, 768]
+        embeds_trunc = flat_inputs_embeds[:, :kept_len, :]
+        mask_trunc_bool = flat_mask_bool[:, :kept_len]
+        attention_mask_trunc = mask_trunc_bool.to(dtype=torch.long)
 
-        # 2. Embeddings
-        h_spk = self.spk_embed(speaker_ids_padded) # [B, S, 64]
-        h_emo = self.emo_embed(emotion_ids_padded) # [B, S, 64]
+        outputs_trunc = self.text_encoder(
+            inputs_embeds=embeds_trunc,
+            attention_mask=attention_mask_trunc,
+        )[0]  # [B, kept_len, d]
 
-        # 3. Concat (768 + 64 + 64 = 896)
-        h_cat = torch.cat([h_text_utt, h_spk, h_emo], dim=-1)
+        if kept_len == total_len:
+            return outputs_trunc, mask_trunc_bool, kept_len
 
-        # 4. Projection (896 -> 768)
-        # [修改點] 在進 MHSA 之前，先降維
-        h_fused = self.fusion_proj(h_cat) # [B, S, 768]
+        pad_len = total_len - kept_len
+        pad_hidden = torch.zeros(B, pad_len, D, device=outputs_trunc.device, dtype=outputs_trunc.dtype)
+        outputs_padded = torch.cat([outputs_trunc, pad_hidden], dim=1)
 
-        # 5. Contextual MHSA (on 768 dim)
-        key_padding_mask = ~utterance_mask 
-        attn_out, _ = self.mhsa(
-            query=h_fused, 
-            key=h_fused, 
-            value=h_fused, 
-            key_padding_mask=key_padding_mask
-        ) # [B, S, 768]
-        # Residual + Norm
-        h_final = self.norm(h_fused + attn_out)
+        pad_mask = torch.zeros(B, pad_len, device=outputs_trunc.device, dtype=torch.bool)
+        mask_padded = torch.cat([mask_trunc_bool, pad_mask], dim=1)
 
-        # Gatedmhsa
-        # attn_out = self.mhsa(h_fused, key_padding_mask=~utterance_mask) 
-        # h_final = self.norm(h_fused + attn_out)
+        return outputs_padded, mask_padded, kept_len
 
-        # 6. Flatten
-        h_text_nodes = h_final[utterance_mask] # [N, 768]
-        
+    # ------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------
+    def forward(
+        self,
+        input_ids_padded,      # [B, S_nodes, T]
+        token_mask_padded,     # [B, S_nodes, T]
+        utterance_mask,        # [B, S_nodes]  (node_mask)
+        speaker_ids_padded,    # [B, S_nodes]
+        emotion_ids_padded,    # [B, S_nodes]
+        pair_utt_index=None,   # [B, 2] (c_idx, t_idx) in utterance-local indices
+    ):
+        """
+        return:
+          h_text_nodes: [Total_Nodes, d_sem]
+        """
+        B, S_nodes, T = input_ids_padded.shape
+        node_mask_bool = self._ensure_bool_mask(utterance_mask)      # [B,S_nodes] node exists mask
+        token_mask_bool = self._ensure_bool_mask(token_mask_padded)  # [B,S_nodes,T]
+
+        # ------------------------------------------------------------
+        # 0) Infer per-graph utterance count (valid_nodes = num_utts + 3)
+        # ------------------------------------------------------------
+        valid_nodes = node_mask_bool.sum(dim=1)            # [B]
+        num_utts = (valid_nodes - 3).clamp(min=0)          # [B]
+        max_utts = int(num_utts.max().item()) if B > 0 else 0
+
+        # utterance-slot mask (only first num_utts are utterances)
+        utt_mask_full = torch.zeros(B, S_nodes, device=node_mask_bool.device, dtype=torch.bool)
+        for i in range(B):
+            u = int(num_utts[i].item())
+            if u > 0:
+                utt_mask_full[i, :u] = True
+
+        # ------------------------------------------------------------
+        # 1) Allocate node container (utter + super)
+        # ------------------------------------------------------------
+        h_nodes_padded = torch.zeros(B, S_nodes, self.d_sem, device=input_ids_padded.device, dtype=torch.float)
+
+        # Keep references for MPEG init / conv mean
+        h_final_utt = None
+        utt_mask_effective = None  # [B, U] bool
+
+        # ------------------------------------------------------------
+        # 2) Utterance nodes: run PLM with injection + doc flatten
+        # ------------------------------------------------------------
+        if max_utts > 0:
+            utt_input_ids = input_ids_padded[:, :max_utts, :]             # [B,U,T]
+            utt_token_mask = token_mask_bool[:, :max_utts, :]             # [B,U,T]
+            utt_speaker_ids = speaker_ids_padded[:, :max_utts]            # [B,U]
+            utt_emotion_ids = emotion_ids_padded[:, :max_utts]            # [B,U]
+            utt_mask_batch = utt_mask_full[:, :max_utts]                  # [B,U]
+
+            # word embeddings
+            word_embeddings_layer = self.text_encoder.get_input_embeddings()
+            word_embs = word_embeddings_layer(utt_input_ids)              # [B,U,T,d]
+
+            # speaker/emotion injection
+            spk_embs = self.spk_embed(utt_speaker_ids).unsqueeze(2)       # [B,U,1,d]
+            emo_embs = self.emo_embed(utt_emotion_ids).unsqueeze(2)       # [B,U,1,d]
+
+            # [CLS] + [SPK] + [EMO] + rest...
+            cls_token_emb = word_embs[:, :, 0:1, :]                       # [B,U,1,d]
+            rest_tokens_emb = word_embs[:, :, 1:, :]                      # [B,U,T-1,d]
+            mixed_embs = torch.cat([cls_token_emb, spk_embs, emo_embs, rest_tokens_emb], dim=2)  # [B,U,T+2,d]
+
+            # mask sync
+            extra_mask = torch.ones(B, max_utts, 2, device=utt_token_mask.device, dtype=torch.bool)
+            cls_mask = utt_token_mask[:, :, 0:1]
+            rest_mask = utt_token_mask[:, :, 1:]
+            mixed_mask_bool = torch.cat([cls_mask, extra_mask, rest_mask], dim=2)  # [B,U,T+2]
+
+            # slots not existing => all False
+            mixed_mask_bool = mixed_mask_bool & utt_mask_batch.unsqueeze(-1)
+
+            # flatten to long doc
+            L = T + 2
+            total_len = max_utts * L
+            flat_inputs_embeds = mixed_embs.reshape(B, total_len, self.d_sem)
+            flat_mask_bool = mixed_mask_bool.reshape(B, total_len)
+
+            outputs_long, flat_mask_synced_bool, _ = self._plm_forward_with_trunc_and_mask_sync(
+                flat_inputs_embeds, flat_mask_bool
+            )  # [B,total_len,d], [B,total_len]
+
+            # unflatten
+            outputs_reshaped = outputs_long.view(B, max_utts, L, self.d_sem)      # [B,U,L,d]
+            mask_reshaped_bool = flat_mask_synced_bool.view(B, max_utts, L)       # [B,U,L]
+
+            # utterance effective mask: exist & has any token after truncation
+            has_any_token = mask_reshaped_bool.any(dim=2)                         # [B,U]
+            utt_mask_effective = utt_mask_batch & has_any_token                   # [B,U]
+
+            # token-level attention pooling
+            h_text_utt = self._attention_pool(outputs_reshaped, mask_reshaped_bool)  # [B,U,d]
+
+            # utterance-level MHSA (mask invalid slots)
+            key_padding_mask = ~utt_mask_effective  # True=mask out
+            attn_out, _ = self.mhsa(
+                query=h_text_utt,
+                key=h_text_utt,
+                value=h_text_utt,
+                key_padding_mask=key_padding_mask,
+            )
+            h_final_utt = self.norm(h_text_utt + self.dropout(attn_out))          # [B,U,d]
+
+            # write back utterance region (keep non-existing slots at zero)
+            h_nodes_padded[:, :max_utts, :] = h_final_utt
+            h_nodes_padded[:, :max_utts, :] = h_nodes_padded[:, :max_utts, :] * utt_mask_batch.unsqueeze(-1)
+
+        # ------------------------------------------------------------
+        # 3) Super nodes init
+        #   - default: learnable embeddings
+        #   - MPEG-style: cause/target init from utterance vectors (if pair_utt_index provided & valid)
+        #   - conv init: mean of valid utterance vectors (if any), else fallback learnable conv
+        # ------------------------------------------------------------
+        for i in range(B):
+            u = int(num_utts[i].item())
+            conv_pos = u
+            cause_pos = u + 1
+            target_pos = u + 2
+
+            # (a) default fallback init
+            if 0 <= conv_pos < S_nodes and node_mask_bool[i, conv_pos]:
+                h_nodes_padded[i, conv_pos] = self.super_node_embed.weight[0]   # conv
+            if 0 <= cause_pos < S_nodes and node_mask_bool[i, cause_pos]:
+                h_nodes_padded[i, cause_pos] = self.super_node_embed.weight[1]  # cause
+            if 0 <= target_pos < S_nodes and node_mask_bool[i, target_pos]:
+                h_nodes_padded[i, target_pos] = self.super_node_embed.weight[2] # target
+
+            # nothing to do if no utterances encoded
+            if h_final_utt is None or utt_mask_effective is None:
+                continue
+
+            # (b) MPEG-style cause/target init from utterances (requires pair_utt_index)
+            if pair_utt_index is not None and pair_utt_index.numel() >= (B * 2):
+                c_idx = int(pair_utt_index[i, 0].item())
+                t_idx = int(pair_utt_index[i, 1].item())
+
+                # cause node init
+                if 0 <= c_idx < max_utts and utt_mask_effective[i, c_idx]:
+                    if 0 <= cause_pos < S_nodes and node_mask_bool[i, cause_pos]:
+                        h_nodes_padded[i, cause_pos] = h_final_utt[i, c_idx]
+
+                # target node init
+                if 0 <= t_idx < max_utts and utt_mask_effective[i, t_idx]:
+                    if 0 <= target_pos < S_nodes and node_mask_bool[i, target_pos]:
+                        h_nodes_padded[i, target_pos] = h_final_utt[i, t_idx]
+
+            # (c) conv init = mean of valid utterances (recommended)
+            if 0 <= conv_pos < S_nodes and node_mask_bool[i, conv_pos]:
+                valid = utt_mask_effective[i]  # [U]
+                if valid.any():
+                    h_nodes_padded[i, conv_pos] = h_final_utt[i, valid].mean(dim=0)
+                # else keep fallback learnable
+
+        # ------------------------------------------------------------
+        # 4) Flatten to [Total_Nodes, d] aligned with PyG Batch ordering
+        # ------------------------------------------------------------
+        h_text_nodes = h_nodes_padded[node_mask_bool]  # [Total_Nodes, d]
         return h_text_nodes
-
-# # Research/IMCEE/modules/crossTower/text_encoder.py
-# # !/usr/bin/env python3
-# # -*- coding: utf-8 -*-
-
-# import torch
-# import torch.nn as nn
-# from transformers import AutoModel
-# import torch.nn.functional as F
-
-# class TextNodeEncoder(nn.Module):
-#     """
-#     CFIB-Style Document Encoder (Full Context Interaction)
-    
-#     [核心改動]
-#     1. Input Formulation: 將 [Batch, Sent, Token] 攤平為 [Batch, Sent*Token] 餵入 RoBERTa。
-#        讓 RoBERTa 能夠看到整段對話的上下文 (Document-Level Encoding)。
-#     2. Pooling: 使用 CFIB 的 Attention Pooling 機制。
-#     3. Windowing: 自動處理超過 512 Token 的長度問題。
-    
-#     輸出: [N, d_text (768)]
-#     """
-#     def __init__(self, text_model_name, num_speakers, num_emotions, 
-#                  spk_dim=64, emo_dim=64, freeze_text=True, dropout=0.1):
-#         super().__init__()
-        
-#         # 1. Text Model
-#         self.text_encoder = AutoModel.from_pretrained(text_model_name)
-#         if freeze_text:
-#             for p in self.text_encoder.parameters():
-#                 p.requires_grad = False
-        
-#         self.d_sem = self.text_encoder.config.hidden_size # 768
-
-#         # [CFIB] Attention Pooling Score Calculation
-#         self.attn_score = nn.Linear(self.d_sem, 1)
-
-#         # 2. Embeddings
-#         self.spk_embed = nn.Embedding(num_speakers, spk_dim)
-#         self.emo_embed = nn.Embedding(num_emotions, emo_dim)
-
-#         # 3. Fusion Projection
-#         fusion_in_dim = self.d_sem + spk_dim + emo_dim
-        
-#         self.fusion_proj = nn.Sequential(
-#             nn.Linear(fusion_in_dim, self.d_sem),
-#             nn.ReLU(),
-#             nn.Dropout(dropout)
-#         )
-
-#         # 4. Contextual MHSA (保留作為最後一層的特徵修飾)
-#         self.mhsa = nn.MultiheadAttention(
-#             embed_dim=self.d_sem, 
-#             num_heads=8, 
-#             dropout=dropout, 
-#             batch_first=True
-#         )
-
-#         self.norm = nn.LayerNorm(self.d_sem)
-
-#     def _attention_pool(self, hidden, mask):
-#         """
-#         CFIB Attention Pooling
-#         hidden: [B, S, T, d]
-#         mask:   [B, S, T]
-#         """
-#         # [B, S, T, 1]
-#         attn_logits = self.attn_score(hidden) 
-        
-#         # Masking: (1-mask) * -9e5
-#         extended_mask = (1.0 - mask.unsqueeze(-1)) * -9e5
-#         attn_logits = attn_logits + extended_mask
-        
-#         # Softmax along Token dimension (dim=2)
-#         alpha = F.softmax(attn_logits, dim=2) 
-        
-#         # Weighted Sum: [B, S, T, d] * [B, S, T, 1] -> sum(dim=2) -> [B, S, d]
-#         weighted_sum = torch.sum(alpha * hidden, dim=2)
-        
-#         return weighted_sum
-
-#     def _process_long_input(self, input_ids, attention_mask):
-#         """
-#         處理超過 512 的長度限制 (Sliding Window 策略)
-#         input_ids: [B, Total_Len]
-#         """
-#         B, Total_Len = input_ids.shape
-#         max_len = 512
-#         stride = 256
-        
-#         if Total_Len <= max_len:
-#             outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)[0]
-#             return outputs
-
-#         # 如果超過 512，切片處理再拼接 (簡易版 Sliding Window)
-#         # 注意：這只是近似解，因為邊界處的 Context 會斷掉，但在 Graph Node Encoder 中是不得不做的妥協
-#         outputs_list = []
-#         for i in range(0, Total_Len, stride):
-#             end = min(i + max_len, Total_Len)
-#             chunk_ids = input_ids[:, i:end]
-#             chunk_mask = attention_mask[:, i:end]
-            
-#             # 確保長度至少為1
-#             if chunk_ids.shape[1] == 0: break
-
-#             out = self.text_encoder(input_ids=chunk_ids, attention_mask=chunk_mask)[0]
-            
-#             # 如果不是第一塊，要扣掉重疊部分 (stride策略需更複雜，這裡採用簡單拼接非重疊部分)
-#             # 這裡為了 "無痛" 且保持維度一致，我們簡單假設 Batch 內所有對話長度不一
-#             # 實作上最保險的方式是: 既然是 Graph Node，我們其實可以退回 Sentence Encoding
-#             # 但既然你要 CFIB 效果，我們這裡做一個簡單的 Padding 處理
-            
-#             # 修正策略：直接切斷 (Truncate) 或只取前 512
-#             # 為了避免複雜的拼接 bug，若超過 512，我們這裡只取前 512 (這是大多數長文檔處理的標準妥協)
-#             # 若要完整保留，建議在 Data Loader 層級就切好
-#             if i == 0:
-#                 outputs_list = out
-#             else:
-#                 # 這裡若要拼接會很複雜，因為 RoBERTa 的 Positional Embedding 是重置的
-#                 pass 
-        
-#         # [妥協] 為了確保程式不崩潰，若超過 512，我們目前只能處理前 512 tokens
-#         # 真正要解決這個需要 Longformer，或是改 Data Loader
-#         final_out = self.text_encoder(input_ids=input_ids[:, :max_len], 
-#                                       attention_mask=attention_mask[:, :max_len])[0]
-        
-#         # Pad back to original length (with zeros) so unflatten works
-#         if Total_Len > max_len:
-#             pad_len = Total_Len - max_len
-#             pad_tensor = torch.zeros(B, pad_len, self.d_sem, device=input_ids.device)
-#             final_out = torch.cat([final_out, pad_tensor], dim=1)
-            
-#         return final_out
-
-#     def forward(self, input_ids_padded, token_mask_padded, utterance_mask, 
-#                 speaker_ids_padded, emotion_ids_padded):
-#         """
-#         Args:
-#             input_ids_padded: [B, S, T] (Batch, Sentences, Tokens)
-#         """
-#         B, S, T = input_ids_padded.shape
-
-#         # ---------------------------------------------------------
-#         # 1. Flatten Inputs: [B, S, T] -> [B, S*T]
-#         # 這樣做讓 RoBERTa 能看到 "跨句子" 的上下文 (Document Level)
-#         # ---------------------------------------------------------
-#         flat_input_ids = input_ids_padded.view(B, S * T)
-#         flat_token_mask = token_mask_padded.view(B, S * T)
-
-#         # 2. RoBERTa Encoding (Document Level)
-#         # 注意：這裡會遇到 512 限制。
-#         # 如果你的對話很長，這一步只會吃到前 512 個 token (約 10-15 句話)
-#         outputs_long = self._process_long_input(flat_input_ids, flat_token_mask) 
-#         # outputs_long: [B, S*T, 768]
-
-#         # 3. Unflatten: 切回 [B, S, T, 768]
-#         # 這樣我們就拿到了 "看過整篇對話" 的每個 Token 的特徵
-#         outputs_reshaped = outputs_long.view(B, S, T, -1)
-
-#         # 4. Attention Pooling (CFIB Style)
-#         # 從 [B, S, T, 768] -> [B, S, 768]
-#         h_text_utt = self._attention_pool(
-#             outputs_reshaped,
-#             token_mask_padded # [B, S, T]
-#         )
-
-#         # 5. Embeddings Lookup & Fusion (不變)
-#         h_spk = self.spk_embed(speaker_ids_padded) 
-#         h_emo = self.emo_embed(emotion_ids_padded) 
-#         h_cat = torch.cat([h_text_utt, h_spk, h_emo], dim=-1) 
-#         h_fused = self.fusion_proj(h_cat) 
-
-#         # 6. Contextual MHSA (不變)
-#         key_padding_mask = ~utterance_mask 
-#         attn_out, _ = self.mhsa(
-#             query=h_fused, key=h_fused, value=h_fused, 
-#             key_padding_mask=key_padding_mask
-#         )
-#         h_final = self.norm(h_fused + attn_out)
-
-#         # 7. Flatten to Nodes
-#         h_text_nodes = h_final[utterance_mask] 
-        
-#         return h_text_nodes

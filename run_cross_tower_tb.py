@@ -18,104 +18,7 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from modules.dataset import CEEEnd2EndDataset, End2EndCollate
 from modules.crossTower.cross_tower_model import CrossTowerCausalModel
-
-# ============================================================
-# Configuration
-# ============================================================
-class PathConfig:
-    BASE_DIR = "/home/joung/r13725060/Research/IMCEE"
-    EXP_DIR  = os.path.join(BASE_DIR, "data/Vexplain")
-    EXP_DIR_GPT  = os.path.join(BASE_DIR, "data/Vexplain_gpt")
-    CKPT_DIR = os.path.join(BASE_DIR, "checkpoints/cross_tower")
-    
-    # [新增] 用於存放 LLM 文字解釋與標籤的路徑
-    GPT_TEXT_DIR = os.path.join(BASE_DIR, "data/plaintext_gpt4omini")
-
-    # Filename tag (Gated Version)
-    SAVE_SUFFIX = "justtest"
-    DATA_DIR = os.path.join(BASE_DIR, "data/preprocess")
-
-    CONV_PATH = os.path.join(DATA_DIR, "conversations.jsonl")
-    # TRAIN_PATH = os.path.join(DATA_DIR, "pairs_train.jsonl")
-    # VALID_PATH = os.path.join(DATA_DIR, "pairs_valid.jsonl")
-    # TEST_PATH  = os.path.join(DATA_DIR, "pairs_test.jsonl")
-    NEW_DATA_DIR = os.path.join(BASE_DIR, "data/preprocess_expanded_final")
-
-    TRAIN_PATH = os.path.join(NEW_DATA_DIR, "new_pairs_train.jsonl")
-    VALID_PATH = os.path.join(NEW_DATA_DIR, "new_pairs_valid.jsonl")
-    TEST_PATH  = os.path.join(NEW_DATA_DIR, "new_pairs_test.jsonl")
-
-    LLM_SHORTCUT_TRAIN = os.path.join(GPT_TEXT_DIR, "explain_train_gpt4omini.jsonl")
-    LLM_SHORTCUT_VALID = os.path.join(GPT_TEXT_DIR, "explain_valid_gpt4omini.jsonl")
-    LLM_SHORTCUT_TEST  = os.path.join(GPT_TEXT_DIR, "explain_test_gpt4omini.jsonl")
-
-    EX_TRAIN_PT  = os.path.join(EXP_DIR, "explain_train_embeddings.pt")
-    EX_TRAIN_TSV = os.path.join(EXP_DIR, "explain_train_results_index.tsv")
-    EX_VALID_PT  = os.path.join(EXP_DIR, "explain_valid_embeddings.pt")
-    EX_VALID_TSV = os.path.join(EXP_DIR, "explain_valid_results_index.tsv")
-    EX_TEST_PT   = os.path.join(EXP_DIR, "explain_test_embeddings.pt")
-    EX_TEST_TSV  = os.path.join(EXP_DIR, "explain_test_results_index.tsv")
-
-    ES_TRAIN_PT  = os.path.join(EXP_DIR_GPT, "explain_train_embeddings.pt")
-    ES_TRAIN_TSV = os.path.join(EXP_DIR_GPT, "explain_train_gpt4omini_index.tsv")
-    ES_VALID_PT  = os.path.join(EXP_DIR_GPT, "explain_valid_embeddings.pt")
-    ES_VALID_TSV = os.path.join(EXP_DIR_GPT, "explain_valid_gpt4omini_index.tsv")
-    ES_TEST_PT   = os.path.join(EXP_DIR_GPT, "explain_test_embeddings.pt")
-    ES_TEST_TSV  = os.path.join(EXP_DIR_GPT, "explain_test_gpt4omini_index.tsv")
-
-    @property
-    def SAVE_MODEL_PATH(self):
-        return os.path.join(self.CKPT_DIR, f"model_{self.SAVE_SUFFIX}.pt")
-    
-    @property
-    def OUT_JSON_PATH(self):
-        return os.path.join(self.BASE_DIR, "outputs", f"test_result_{self.SAVE_SUFFIX}.json")
-
-    @property
-    def TENSORBOARD_LOG_DIR(self):  # [Added] Base dir for TensorBoard logs
-        return os.path.join(self.BASE_DIR, "outputs", "runs")
-
-
-class ModelConfig:
-    TEXT_MODEL = "roberta-base"
-    HIDDEN_DIM = 768
-    # TEXT_MODEL = "roberta-large"
-    # HIDDEN_DIM = 1024
-    FREEZE_TEXT = True 
-    NUM_GNN_LAYERS = 5
-    GNN_DROPOUT    = 0.3
-    BASE_DROPOUT   = 0.2
-    USE_EXPLAIN = False      # edge-level
-    USE_EXPLAIN_SPACE = True # teacher space (Must be enabled)
-
-class TrainConfig:
-    RUN_MODE = "test"   # "train" or "test"
-    SEED = 42
-    EPOCHS = 30
-    BATCH_SIZE = 4
-    ACCUM_STEPS = 1
-    PATIENCE = 5
-    WARMUP_RATIO = 0.1
-    POS_WEIGHT_MULT = 1
-    
-    # Distillation weight
-    LAMBDA_EXPL = 1.0   
-
-class OptimConfig:
-    LR_BASE = 1e-4
-    WD_BASE = 1e-4
-    LR_PLM  = 3e-6
-    WD_PLM  = 0.01
-    LR_GNN  = 1e-3
-    WD_GNN  = 0.0
-
-class Config:
-    path = PathConfig()
-    model = ModelConfig()
-    train = TrainConfig()
-    optim = OptimConfig()
-
-cfg = Config()
+from config import cfg
 
 # ============================================================
 # Utils
@@ -148,45 +51,89 @@ def compute_pos_weight_from_dataset(train_dataset):
 def calculate_pair_distance(batch):
     """
     Calculates the true utterance distance for each Cause-Target pair in the batch.
-    batch.target_node_indices: [B, 2] -> [cause_node_idx, target_node_idx]
-    batch.edge_index: [2, E]
+
+    Priority:
+      1) Use batch.pair_uttpos if provided (stable)
+      2) Fallback: infer anchored utterances via Type-0 edges
+         NOTE: current dataset Type-0 is utt -> super (NOT super -> utt)
+         and PyG batching makes edge_index global while target_node_indices are local.
     """
     # 1) 優先用 dataset 提供的 mapping（最穩定）
     if hasattr(batch, "pair_uttpos") and batch.pair_uttpos is not None:
-        pos = batch.pair_uttpos  # [B, 2]
+        pos = batch.pair_uttpos  # [B,2] or [B,1,2]
+        if pos.dim() == 3:
+            pos = pos.view(-1, 2)
         d = (pos[:, 1] - pos[:, 0]).abs()
         return d.detach().cpu().numpy()
-    
+
+    # -----------------------------
+    # 2) Fallback: use Type-0 edges
+    # -----------------------------
     batch_dists = []
-    
-    cause_nodes = batch.target_node_indices[:, 0]
-    target_nodes = batch.target_node_indices[:, 1]
-    
+
+    # local node indices per-graph
+    cause_nodes_local = batch.target_node_indices[:, 0]
+    target_nodes_local = batch.target_node_indices[:, 1]
+
+    # edge_index are global after batching
     edge_src = batch.edge_index[0]
     edge_tgt = batch.edge_index[1]
-    
-    for i in range(len(cause_nodes)):
-        c_node = cause_nodes[i].item()
-        t_node = target_nodes[i].item()
-        
-        # Dataset graph logic: CauseNode -> CauseUtt (Type 0)
-        mask_c = (edge_src == c_node)
+    edge_types = batch.edge_types if hasattr(batch, "edge_types") else None
+
+    # need ptr offsets to convert local->global and global->local
+    if not hasattr(batch, "ptr"):
+        # keep old behavior as safe fallback (best-effort, but may be wrong for batch>1)
+        for i in range(len(cause_nodes_local)):
+            # old heuristic (NOT ideal)
+            c_node = cause_nodes_local[i].item()
+            t_node = target_nodes_local[i].item()
+
+            # old logic assumed super -> utt; we keep a conservative fallback to avoid crash
+            mask_c = (edge_src == c_node)
+            c_utt_idx = edge_tgt[mask_c].min().item() if mask_c.any() else 0
+
+            mask_t = (edge_src == t_node)
+            t_utt_idx = edge_tgt[mask_t].min().item() if mask_t.any() else 0
+
+            batch_dists.append(abs(t_utt_idx - c_utt_idx))
+
+        return np.array(batch_dists)
+
+    offsets = batch.ptr[:-1]  # [B]
+
+    for i in range(len(cause_nodes_local)):
+        off = offsets[i].item()
+
+        # convert local super-node idx -> global idx
+        c_super_g = int(cause_nodes_local[i].item() + off)
+        t_super_g = int(target_nodes_local[i].item() + off)
+
+        # Type0 is utt -> super, so we search edges where tgt == super
+        if edge_types is not None:
+            mask_c = (edge_types == 0) & (edge_tgt == c_super_g)
+            mask_t = (edge_types == 0) & (edge_tgt == t_super_g)
+        else:
+            # best-effort if no edge_types
+            mask_c = (edge_tgt == c_super_g)
+            mask_t = (edge_tgt == t_super_g)
+
+        # get anchored utterance global idx from edge_src, then to local by subtracting off
         if mask_c.any():
-            c_utt_idx = edge_tgt[mask_c].min().item()
+            c_utt_local = int((edge_src[mask_c].min().item()) - off)
+            c_utt_local = max(c_utt_local, 0)
         else:
-            c_utt_idx = 0
-            
-        # TargetNode -> TargetUtt
-        mask_t = (edge_src == t_node)
+            c_utt_local = 0
+
         if mask_t.any():
-            t_utt_idx = edge_tgt[mask_t].min().item()
+            t_utt_local = int((edge_src[mask_t].min().item()) - off)
+            t_utt_local = max(t_utt_local, 0)
         else:
-            t_utt_idx = 0
-            
-        dist = abs(t_utt_idx - c_utt_idx)
-        batch_dists.append(dist)
-        
+            t_utt_local = 0
+
+        batch_dists.append(abs(t_utt_local - c_utt_local))
+
     return np.array(batch_dists)
+
 
 
 def analyze_distance_performance(preds, labels, dists):
@@ -492,7 +439,7 @@ def main():
     print(f"Device: {device}")
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.TEXT_MODEL)
-    collate_fn = End2EndCollate(tokenizer)
+    # collate_fn = End2EndCollate(tokenizer)
 
     if cfg.train.RUN_MODE == "train":
         # [修改重點] 使用明確的關鍵字參數來避免位置衝突
@@ -518,6 +465,14 @@ def main():
             expl_space_tsv=cfg.path.ES_VALID_TSV,
             use_expl_space=cfg.model.USE_EXPLAIN_SPACE,
         )
+        collate_fn = End2EndCollate(
+            tokenizer,
+            spk_pad_id=train_dataset.spk_pad_id,  # 確保對齊
+            emo_pad_id=train_dataset.emo_pad_id
+        )
+
+
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=cfg.train.BATCH_SIZE,
@@ -611,6 +566,12 @@ def main():
             expl_space_tsv=cfg.path.ES_TEST_TSV,
             use_expl_space=cfg.model.USE_EXPLAIN_SPACE,
         )
+        collate_fn = End2EndCollate(
+                    tokenizer,
+                    spk_pad_id=test_dataset.spk_pad_id,
+                    emo_pad_id=test_dataset.emo_pad_id
+                )
+
         test_loader = DataLoader(
             test_dataset,
             batch_size=cfg.train.BATCH_SIZE,
