@@ -306,26 +306,34 @@ class CEEEnd2EndDataset(Dataset):
                 # ---------------------------
                 edge_src, edge_tgt, edge_types, edge_features, edge_distances = [], [], [], [], []
 
-                # (1) Type 0: utterance -> super anchoring edges
-                # 只保留 utt -> super（移除 super -> utt）
-                self._add_edge(edge_src, edge_tgt, edge_types, edge_distances, edge_features,
-                               c_idx, cause_node_idx, 0, 0, expl_feat)
-                self._add_edge(edge_src, edge_tgt, edge_types, edge_distances, edge_features,
-                               t_idx, target_node_idx, 0, 0, expl_feat)
+                # # 刪掉了(1) Type 0: utterance -> super anchoring edges
+                # # 只保留 utt -> super（移除 super -> utt）
+                # self._add_edge(edge_src, edge_tgt, edge_types, edge_distances, edge_features,
+                #                c_idx, cause_node_idx, 0, 0, expl_feat)
+                # self._add_edge(edge_src, edge_tgt, edge_types, edge_distances, edge_features,
+                #                t_idx, target_node_idx, 0, 0, expl_feat)
 
                 # (1.5) Type 3: MPEG-style context window edges (preceding utterances -> super), w=4
                 # 注意：不包含 c_idx/t_idx 本身，避免與 Type 0 重複
+                # (1) Type 3: context window edges (including self) -> super, w=4
                 w = 4
 
                 c_start = max(0, c_idx - w)
-                for u in range(c_start, c_idx):
-                    self._add_edge(edge_src, edge_tgt, edge_types, edge_distances, edge_features,
-                                   u, cause_node_idx, 3, c_idx - u, zero_feat)
+                for u in range(c_start, c_idx + 1):  # include self
+                    feat = expl_feat if (u == c_idx) else zero_feat
+                    self._add_edge(
+                        edge_src, edge_tgt, edge_types, edge_distances, edge_features,
+                        u, cause_node_idx, 3, c_idx - u, feat
+                    )
 
                 t_start = max(0, t_idx - w)
-                for u in range(t_start, t_idx):
-                    self._add_edge(edge_src, edge_tgt, edge_types, edge_distances, edge_features,
-                                   u, target_node_idx, 3, t_idx - u, zero_feat)
+                for u in range(t_start, t_idx + 1):  # include self
+                    feat = expl_feat if (u == t_idx) else zero_feat
+                    self._add_edge(
+                        edge_src, edge_tgt, edge_types, edge_distances, edge_features,
+                        u, target_node_idx, 3, t_idx - u, feat
+                    )
+
 
                 # (2) Temporal edges (Type 1/2): utterance -> utterance, distance up to 4
                 for i in range(num_utts):
@@ -350,13 +358,24 @@ class CEEEnd2EndDataset(Dataset):
                         self._add_edge(edge_src, edge_tgt, edge_types, edge_distances, edge_features,
                                        u, v, 4, v - u, zero_feat)
 
-                # (4) Global edges (Type 5): conv <-> utterances
-                # conv 只連 utterances，不連 super nodes
+                # (4) Global edges (Type 5): conv <-> (utterances + super nodes)
+                # 讓 conv 成為全局 hub：連 utterances + cause/target super nodes（雙向）
                 for i in range(num_utts):
                     self._add_edge(edge_src, edge_tgt, edge_types, edge_distances, edge_features,
-                                   conv_node_idx, i, 5, 0, zero_feat)
+                                conv_node_idx, i, 5, 0, zero_feat)
                     self._add_edge(edge_src, edge_tgt, edge_types, edge_distances, edge_features,
-                                   i, conv_node_idx, 5, 0, zero_feat)
+                                i, conv_node_idx, 5, 0, zero_feat)
+
+                # 新增：conv <-> cause/target super nodes
+                self._add_edge(edge_src, edge_tgt, edge_types, edge_distances, edge_features,
+                            conv_node_idx, cause_node_idx, 5, 0, zero_feat)
+                self._add_edge(edge_src, edge_tgt, edge_types, edge_distances, edge_features,
+                            cause_node_idx, conv_node_idx, 5, 0, zero_feat)
+
+                self._add_edge(edge_src, edge_tgt, edge_types, edge_distances, edge_features,
+                            conv_node_idx, target_node_idx, 5, 0, zero_feat)
+                self._add_edge(edge_src, edge_tgt, edge_types, edge_distances, edge_features,
+                            target_node_idx, conv_node_idx, 5, 0, zero_feat)
 
                 # target_node_indices：你後續 model 取這兩個 index 做分類
                 target_indices_tensor = torch.tensor([[cause_node_idx, target_node_idx]], dtype=torch.long)

@@ -18,7 +18,7 @@ class PathConfig:
     GPT_TEXT_DIR = os.path.join(BASE_DIR, "data/plaintext_gpt4omini")
 
     # Filename tag
-    SAVE_SUFFIX = "expandData_concat_layer5_earlyfusionNode_type3add_large"
+    SAVE_SUFFIX = "beta1_large"
     DATA_DIR = os.path.join(BASE_DIR, "data/preprocess")
 
     CONV_PATH = os.path.join(DATA_DIR, "conversations.jsonl")
@@ -64,7 +64,7 @@ class ModelConfig:
     # HIDDEN_DIM = 768
     TEXT_MODEL = "roberta-large"
     HIDDEN_DIM = 1024
-    FREEZE_TEXT = True
+    FREEZE_TEXT = False
     NUM_GNN_LAYERS = 5
     GNN_DROPOUT    = 0.3
     BASE_DROPOUT   = 0.2
@@ -87,7 +87,7 @@ class TrainConfig:
 class OptimConfig:
     LR_BASE = 1e-4
     WD_BASE = 1e-4
-    LR_PLM  = 3e-6
+    LR_PLM  = 1e-5
     WD_PLM  = 0.01
     LR_GNN  = 1e-3
     WD_GNN  = 0.0
